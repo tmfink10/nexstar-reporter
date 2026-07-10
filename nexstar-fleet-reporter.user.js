@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         NexStar Fleet Reporter
 // @namespace    https://nexusnavigators.us/
-// @version      1.8.1
+// @version      1.9.0
 // @description  Reports your Nexus Legacy fleet positions to the NexStar map, and answers the map's fuel-estimate and own-planet logistics requests. Your session token never leaves your browser. SECURITY: hosted from a public branch-protected GitHub repo, no silent auto-update; the map can only run self-owned transfers without an in-game confirm.
 // @match        https://s0.nexuslegacy.space/*
 // @match        https://nexstar.nexusnavigators.us/*
@@ -245,6 +245,36 @@
     return { infos: out, catalog: catalog.length ? catalog : null };
   }
 
+  // Own mining outposts (/api/outposts): level, module levels, stored
+  // resources + rates, and the asteroid field being worked. Slimmed
+  // client-side (data minimization, same policy as `me`): only the fields the
+  // map's Empire Console shows — construction job ids, relocation state,
+  // rename cooldowns etc. never leave the browser.
+  const OUTPOST_RES_KEYS = ['ore', 'silicates', 'hydrogen', 'alloys', 'cryoIce',
+                            'quantumDust', 'plasmaCore', 'bioExtract', 'darkMatter'];
+  function slimOutpost(o) {
+    if (!o || o.id == null) return null;
+    const f = o.asteroidField || {};
+    const resources = {}, rates = {};
+    OUTPOST_RES_KEYS.forEach(k => {
+      if (+o[k] > 0) resources[k] = +o[k];
+      if (+o[k + 'Rate'] > 0) rates[k] = +o[k + 'Rate'];
+    });
+    return {
+      id: o.id, name: o.name, level: o.level, systemId: o.systemId,
+      resources, rates,
+      basicStorage: o.basicStorage, rareStorage: o.rareStorage,
+      hp: o.hp, maxHp: o.maxHp, shieldHp: o.shieldHp, shieldMaxHp: o.shieldMaxHp,
+      deployedShipCount: o.deployedShipCount,
+      isConstructing: !!o.isConstructing,
+      constructionEndsAt: o.constructionEndsAt || null,
+      pendingBuildingKey: o.pendingBuildingKey || null,
+      buildings: (o.buildings || []).map(b => ({ key: b && (b.buildingKey || b.key), level: (b && b.level) || 0 })),
+      field: { id: f.id, name: f.name, fieldType: f.fieldType, richness: f.richness,
+               totalResources: f.totalResources, remainingResources: f.remainingResources },
+    };
+  }
+
   let running = false;
   let runStartedAt = 0;
   async function report(manual) {
@@ -311,6 +341,14 @@
         }
       } catch (e) { /* battle reports optional */ }
 
+      // Own mining outposts — optional (older servers / none built yet).
+      await sleep(API_DELAY_MS);
+      let outposts = [];
+      try {
+        const op = await gget('/api/outposts');
+        outposts = ((op && op.outposts) || []).map(slimOutpost).filter(Boolean);
+      } catch (e) { /* outposts optional */ }
+
       // Building levels per colony (cached 5 min) + the static-definitions
       // catalog at most once per 24h — see planetInfos.
       const pi = await planetInfos(planets);
@@ -325,7 +363,7 @@
 
       const scriptVersion = (typeof GM_info !== 'undefined' && GM_info.script && GM_info.script.version) || null;
       const payload = { me: meSlim, planetFleets, planetInfos: pi.infos, missions, maxFleetSlots,
-                        spyReports, research, battleReports, scriptVersion };
+                        spyReports, research, battleReports, outposts, scriptVersion };
       if (pi.catalog) payload.buildingCatalog = pi.catalog;
       const res = await post(payload, key);
       if (res.ok) {
