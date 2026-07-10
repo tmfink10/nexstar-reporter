@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         NexStar Fleet Reporter
 // @namespace    https://nexusnavigators.us/
-// @version      1.9.0
+// @version      1.10.0
 // @description  Reports your Nexus Legacy fleet positions to the NexStar map, and answers the map's fuel-estimate and own-planet logistics requests. Your session token never leaves your browser. SECURITY: hosted from a public branch-protected GitHub repo, no silent auto-update; the map can only run self-owned transfers without an in-game confirm.
 // @match        https://s0.nexuslegacy.space/*
 // @match        https://nexstar.nexusnavigators.us/*
@@ -209,6 +209,7 @@
   // field survives, only the definition bloat is slimmed to {key, name}.
   const BUILDING_CATALOG_TTL_MS = 24 * 60 * 60 * 1000;
   let _planetInfoCache = { at: 0, data: {} };
+  let _shipyardCache = { at: 0, data: {} };
   function slimPlanetInfo(d) {
     const buildings = ((d && d.buildings) || [])
       .filter(b => b && ((b.level || 0) > 0 || b.isUpgrading))
@@ -217,12 +218,28 @@
       }));
     return { planet: (d && d.planet) || null, buildings };
   }
+  // /api/planets/{id}/shipyard: planetaryQueue/orbitalQueue are each a SINGLE
+  // object (the currently active build) or null — verified live 2026-07-10.
+  // Slimmed to just what the map's "in progress" card needs.
+  function slimShipyard(d) {
+    const one = (q) => (q && q.shipKey) ? {
+      shipKey: q.shipKey, shipName: q.shipName, quantity: q.quantity || 1,
+      startsAt: q.startsAt, endsAt: q.endsAt, isRepair: !!q.isRepair,
+    } : null;
+    const planetaryQueue = one(d && d.planetaryQueue);
+    const orbitalQueue = one(d && d.orbitalQueue);
+    return (planetaryQueue || orbitalQueue) ? { planetaryQueue, orbitalQueue } : null;
+  }
+  // Building levels + shipyard queues share the same 5-minute cache — both
+  // change slowly enough that a live countdown ticking client-side (from the
+  // endsAt each carries) covers the gap between refreshes.
   async function planetInfos(planets) {
     const catalogDue = Date.now() - +(GM_getValue('nx_bcat_at', 0)) > BUILDING_CATALOG_TTL_MS;
     if (!catalogDue && Date.now() - _planetInfoCache.at < PLANET_INFO_TTL_MS) {
-      return { infos: _planetInfoCache.data, catalog: null };
+      return { infos: _planetInfoCache.data, catalog: null, shipyards: _shipyardCache.data };
     }
     const out = {};
+    const shipyards = {};
     const defs = {};   // building key -> full raw definition (newest wins)
     for (const p of planets) {
       if (p == null || p.id == null) continue;
@@ -238,11 +255,18 @@
         }
       }
       catch (e) { /* skip a planet we can't read */ }
+      await sleep(API_DELAY_MS);
+      try {
+        const sy = slimShipyard(await gget('/api/planets/' + p.id + '/shipyard'));
+        if (sy) shipyards[p.id] = sy;
+      }
+      catch (e) { /* shipyard queue optional */ }
     }
     _planetInfoCache = { at: Date.now(), data: out };
+    _shipyardCache = { at: Date.now(), data: shipyards };
     const catalog = Object.values(defs);
     if (catalog.length) GM_setValue('nx_bcat_at', Date.now());
-    return { infos: out, catalog: catalog.length ? catalog : null };
+    return { infos: out, catalog: catalog.length ? catalog : null, shipyards };
   }
 
   // Own mining outposts (/api/outposts): level, module levels, stored
@@ -317,11 +341,18 @@
       catch (e) { /* spy reports optional */ }
 
       // Research is account-wide; any owned planet id works as the lab context.
+      // The same response also carries activeResearches — each entry names its
+      // OWN planetId (the lab it's running at), not the query param.
       await sleep(API_DELAY_MS);
       let research = [];
+      let researchActive = [];
       const firstPlanet = planets.find(p => p && p.id != null);
       if (firstPlanet) {
-        try { const rs = await gget('/api/research?planetId=' + firstPlanet.id); research = (rs && rs.research) || []; }
+        try {
+          const rs = await gget('/api/research?planetId=' + firstPlanet.id);
+          research = (rs && rs.research) || [];
+          researchActive = (rs && rs.activeResearches) || [];
+        }
         catch (e) { /* research optional — strength falls back to base attack */ }
       }
 
@@ -363,7 +394,8 @@
 
       const scriptVersion = (typeof GM_info !== 'undefined' && GM_info.script && GM_info.script.version) || null;
       const payload = { me: meSlim, planetFleets, planetInfos: pi.infos, missions, maxFleetSlots,
-                        spyReports, research, battleReports, outposts, scriptVersion };
+                        spyReports, research, researchActive, battleReports, outposts,
+                        shipyard: pi.shipyards, scriptVersion };
       if (pi.catalog) payload.buildingCatalog = pi.catalog;
       const res = await post(payload, key);
       if (res.ok) {
