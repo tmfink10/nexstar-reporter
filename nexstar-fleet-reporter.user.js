@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         NexStar Fleet Reporter
 // @namespace    https://nexusnavigators.us/
-// @version      1.12.0
+// @version      1.13.0
 // @description  Reports your Nexus Legacy fleet positions to the NexStar map, and answers the map's fuel-estimate and own-planet logistics requests. Your session token never leaves your browser. SECURITY: hosted from a public branch-protected GitHub repo, no silent auto-update; the map can only run self-owned actions (transfers, colony builds) without an in-game confirm.
 // @match        https://s0.nexuslegacy.space/*
 // @match        https://nexstar.nexusnavigators.us/*
@@ -730,6 +730,28 @@
     return gamePost(endpoint, null);   // bodyless POST
   }
 
+  // ── Colony build cancel (viewer "✕ Cancel" on a construction card, v1.13) ────
+  // Same slot resolution as buildUpgrade (definition.id), endpoint regex-pinned to
+  // the CANCEL route. Self-owned planets only. A cancel refunds materials to your
+  // OWN colony and can't touch anyone else, so it stays in the safe self-action
+  // tier (no in-game confirm), matching build-upgrade.
+  async function buildCancel(req) {
+    const b = req || {};
+    const pid = +b.planetId;
+    const key = String(b.buildingKey || '');
+    if (!pid || !key) return Promise.reject(new Error('bad build-cancel request'));
+    const owned = await ownedPlanetIds();
+    if (!owned.has(pid)) return Promise.reject(new Error('planet not owned — cancel refused'));
+    const d = await gget('/api/planets/' + pid);
+    const slot = ((d && d.buildings) || []).find(x => x && x.definition && x.definition.key === key);
+    const defId = slot && slot.definition && slot.definition.id;
+    if (defId == null) return Promise.reject(new Error('no building definition id for "' + key + '"'));
+    const endpoint = '/api/buildings/planets/' + pid + '/buildings/' + defId + '/cancel';
+    if (!/^\/api\/buildings\/planets\/\d+\/buildings\/\d+\/cancel$/.test(endpoint))
+      return Promise.reject(new Error('endpoint not allowed'));   // defense in depth
+    return gamePost(endpoint, null);   // bodyless POST
+  }
+
   // ── Colony ship building (viewer shipyard planner, v1.12) ──────────────────
   // shipyard-info: live buildable-ship list for a colony (the report only carries
   // the ACTIVE queue, not the catalog). Filtered to what can actually be built
@@ -773,7 +795,8 @@
 
   const RPC = { 'fuel-estimate': fuelEstimate, 'launch-mission': launchMission, 'recall-mission': recallMission,
                 'planet-info': planetInfo, 'explore-scan': exploreScan, 'explore-dispatch': exploreDispatch,
-                'build-upgrade': buildUpgrade, 'shipyard-info': shipyardInfo, 'ship-build': shipBuild };
+                'build-upgrade': buildUpgrade, 'build-cancel': buildCancel, 'shipyard-info': shipyardInfo,
+                'ship-build': shipBuild };
 
   window.addEventListener('message', async (ev) => {
     const d = ev.data;
