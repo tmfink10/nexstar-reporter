@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         NexStar Fleet Reporter
 // @namespace    https://nexusnavigators.us/
-// @version      1.13.0
+// @version      1.14.0
 // @description  Reports your Nexus Legacy fleet positions to the NexStar map, and answers the map's fuel-estimate and own-planet logistics requests. Your session token never leaves your browser. SECURITY: hosted from a public branch-protected GitHub repo, no silent auto-update; the map can only run self-owned actions (transfers, colony builds) without an in-game confirm.
 // @match        https://s0.nexuslegacy.space/*
 // @match        https://nexstar.nexusnavigators.us/*
@@ -219,16 +219,35 @@
     return { planet: (d && d.planet) || null, buildings };
   }
   // /api/planets/{id}/shipyard: planetaryQueue/orbitalQueue are each a SINGLE
-  // object (the currently active build) or null — verified live 2026-07-10.
-  // Slimmed to just what the map's "in progress" card needs.
+  // object (the currently active build) or null; planetaryQueueAll/orbitalQueueAll
+  // carry the FULL per-yard queue (active first, then pending — each with its own
+  // `id` for cancel), and maxQueueSize is the cap (active + pending). Verified live
+  // 2026-07-10 (single active) / 2026-07-12 (queue + ids). We keep the game's raw
+  // field names in the slim copy so the server-side parse_shipyard_queue handles
+  // this slim body and a direct game body identically. Entry `id` rides along now
+  // — it's needed to cancel a specific queued build.
   function slimShipyard(d) {
-    const one = (q) => (q && q.shipKey) ? {
-      shipKey: q.shipKey, shipName: q.shipName, quantity: q.quantity || 1,
-      startsAt: q.startsAt, endsAt: q.endsAt, isRepair: !!q.isRepair,
+    // Full queue entry (active or pending). Pending entries legitimately carry
+    // null startsAt/endsAt until they become active, so tolerate missing timing.
+    const entry = (q) => (q && q.id != null && q.shipKey) ? {
+      id: q.id, shipKey: q.shipKey, shipName: q.shipName || null, quantity: q.quantity || 1,
+      startsAt: q.startsAt || null, endsAt: q.endsAt || null,
+      isRepair: !!q.isRepair, status: q.status || null,
     } : null;
+    // Active-summary object (the old shape the console's summary card reads),
+    // now also carrying `id`.
+    const one = (q) => (q && q.shipKey) ? {
+      id: (q.id != null ? q.id : null), shipKey: q.shipKey, shipName: q.shipName,
+      quantity: q.quantity || 1, startsAt: q.startsAt, endsAt: q.endsAt, isRepair: !!q.isRepair,
+    } : null;
+    const arr = (a) => Array.isArray(a) ? a.map(entry).filter(Boolean) : [];
     const planetaryQueue = one(d && d.planetaryQueue);
     const orbitalQueue = one(d && d.orbitalQueue);
-    return (planetaryQueue || orbitalQueue) ? { planetaryQueue, orbitalQueue } : null;
+    const planetaryQueueAll = arr(d && d.planetaryQueueAll);
+    const orbitalQueueAll = arr(d && d.orbitalQueueAll);
+    const maxQueueSize = (d && +d.maxQueueSize) || 0;
+    const any = planetaryQueue || orbitalQueue || planetaryQueueAll.length || orbitalQueueAll.length;
+    return any ? { planetaryQueue, orbitalQueue, planetaryQueueAll, orbitalQueueAll, maxQueueSize } : null;
   }
   // Building levels + shipyard queues share the same 5-minute cache — both
   // change slowly enough that a live countdown ticking client-side (from the
@@ -775,8 +794,13 @@
       .filter(s => s && s.available && s.researchMet && s.shipyardMet && yard[s.shipyardName])
       .map(s => ({ id: s.id, key: s.key, name: s.name, yard: yard[s.shipyardName],
                    cost: _shipCost(s), buildTime: +s.buildTime || 0, sortOrder: +s.sortOrder || 0 }));
+    // Also hand back the live per-yard queue (active first, then pending — each
+    // with its `id`) so the ship panel can show/cancel the current queue without
+    // waiting on the next slow report. Same slim shape the report carries.
+    const sy = slimShipyard(d) || {};
     return { ships, planetaryActive: !!(d && d.planetaryQueue), orbitalActive: !!(d && d.orbitalQueue),
-             maxQueueSize: (d && d.maxQueueSize) || 0 };
+             maxQueueSize: (d && d.maxQueueSize) || 0,
+             planetaryQueue: sy.planetaryQueueAll || [], orbitalQueue: sy.orbitalQueueAll || [] };
   }
   // ship-build: POST the shipyard build. Self-owned planets only; the endpoint is
   // regex-pinned; body is { shipDefId, quantity } (shipDefId = ships[].id).
@@ -792,11 +816,27 @@
       return Promise.reject(new Error('endpoint not allowed'));   // defense in depth
     return gamePost(endpoint, { shipDefId, quantity });
   }
+  // ship-cancel: cancel one queued/active shipyard build by its queue-entry id
+  // (POST /shipyard/cancel/{queueId}, 100% refunded to your OWN colony). The id
+  // comes from the report's queue entries — no slot resolution needed. Self-owned
+  // planets only, endpoint regex-pinned; a refund can't touch anyone else, so it
+  // stays in the safe self-action tier (no in-game confirm), like build-cancel.
+  async function shipCancel(req) {
+    const b = req || {};
+    const pid = +b.planetId, queueId = +b.queueId;
+    if (!pid || !queueId) return Promise.reject(new Error('bad ship-cancel request'));
+    const owned = await ownedPlanetIds();
+    if (!owned.has(pid)) return Promise.reject(new Error('planet not owned — cancel refused'));
+    const endpoint = '/api/planets/' + pid + '/shipyard/cancel/' + queueId;
+    if (!/^\/api\/planets\/\d+\/shipyard\/cancel\/\d+$/.test(endpoint))
+      return Promise.reject(new Error('endpoint not allowed'));   // defense in depth
+    return gamePost(endpoint, {});   // empty body
+  }
 
   const RPC = { 'fuel-estimate': fuelEstimate, 'launch-mission': launchMission, 'recall-mission': recallMission,
                 'planet-info': planetInfo, 'explore-scan': exploreScan, 'explore-dispatch': exploreDispatch,
                 'build-upgrade': buildUpgrade, 'build-cancel': buildCancel, 'shipyard-info': shipyardInfo,
-                'ship-build': shipBuild };
+                'ship-build': shipBuild, 'ship-cancel': shipCancel };
 
   window.addEventListener('message', async (ev) => {
     const d = ev.data;
