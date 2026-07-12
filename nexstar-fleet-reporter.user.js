@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         NexStar Fleet Reporter
 // @namespace    https://nexusnavigators.us/
-// @version      1.10.0
-// @description  Reports your Nexus Legacy fleet positions to the NexStar map, and answers the map's fuel-estimate and own-planet logistics requests. Your session token never leaves your browser. SECURITY: hosted from a public branch-protected GitHub repo, no silent auto-update; the map can only run self-owned transfers without an in-game confirm.
+// @version      1.11.0
+// @description  Reports your Nexus Legacy fleet positions to the NexStar map, and answers the map's fuel-estimate and own-planet logistics requests. Your session token never leaves your browser. SECURITY: hosted from a public branch-protected GitHub repo, no silent auto-update; the map can only run self-owned actions (transfers, colony builds) without an in-game confirm.
 // @match        https://s0.nexuslegacy.space/*
 // @match        https://nexstar.nexusnavigators.us/*
 // @run-at       document-idle
@@ -450,12 +450,16 @@
   })();
   const okOrigin = (o) => VIEWER_ORIGINS.indexOf(o) !== -1;
 
+  // POST to a same-origin game route. `body === null` sends NO body (some game
+  // mutations, e.g. building upgrade, are bodyless — content-length 0); any other
+  // value (incl. undefined) is JSON-encoded as before.
   async function gamePost(path, body) {
-    const r = await fetch(path, {
-      method: 'POST', credentials: 'include',
-      headers: { 'Content-Type': 'application/json', accept: 'application/json' },
-      body: JSON.stringify(body || {}),
-    });
+    const opts = { method: 'POST', credentials: 'include', headers: { accept: 'application/json' } };
+    if (body !== null) {
+      opts.headers['Content-Type'] = 'application/json';
+      opts.body = JSON.stringify(body || {});
+    }
+    const r = await fetch(path, opts);
     let data = null;
     try { data = JSON.parse(await r.text()); } catch (e) { /* tolerate non-JSON error bodies */ }
     if (!r.ok) {
@@ -697,8 +701,34 @@
       .then(results => (results.length === 1 ? results[0] : { results }));
   }
 
+  // ── Colony build / upgrade (viewer build planner, v1.11) ───────────────────
+  // The viewer sends { planetId, buildingKey }. The report doesn't carry the
+  // building SLOT id, so resolve it live from /api/planets, then POST the upgrade
+  // with an EMPTY body (matching the game). One slot per building type (level 0 =
+  // unbuilt) means this covers BOTH upgrading an existing building AND building a
+  // new one. SELF-OWNED planets only, and the endpoint is regex-pinned to the
+  // upgrade route — fail closed. No in-game confirm: a build on your OWN colony
+  // spends only your own resources and can't be used to rob you or attack anyone
+  // (unlike a fleet dispatch), so it stays in the "safe self-action" tier.
+  async function buildUpgrade(req) {
+    const b = req || {};
+    const pid = +b.planetId;
+    const key = String(b.buildingKey || '');
+    if (!pid || !key) return Promise.reject(new Error('bad build request'));
+    const owned = await ownedPlanetIds();
+    if (!owned.has(pid)) return Promise.reject(new Error('planet not owned — build refused'));
+    const d = await gget('/api/planets/' + pid);
+    const slot = ((d && d.buildings) || []).find(x => x && x.definition && x.definition.key === key);
+    if (!slot || slot.id == null) return Promise.reject(new Error('no building slot for "' + key + '"'));
+    const endpoint = '/api/buildings/planets/' + pid + '/buildings/' + slot.id + '/upgrade';
+    if (!/^\/api\/buildings\/planets\/\d+\/buildings\/\d+\/upgrade$/.test(endpoint))
+      return Promise.reject(new Error('endpoint not allowed'));   // defense in depth
+    return gamePost(endpoint, null);   // bodyless POST
+  }
+
   const RPC = { 'fuel-estimate': fuelEstimate, 'launch-mission': launchMission, 'recall-mission': recallMission,
-                'planet-info': planetInfo, 'explore-scan': exploreScan, 'explore-dispatch': exploreDispatch };
+                'planet-info': planetInfo, 'explore-scan': exploreScan, 'explore-dispatch': exploreDispatch,
+                'build-upgrade': buildUpgrade };
 
   window.addEventListener('message', async (ev) => {
     const d = ev.data;
