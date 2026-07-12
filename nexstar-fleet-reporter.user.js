@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         NexStar Fleet Reporter
 // @namespace    https://nexusnavigators.us/
-// @version      1.11.0
+// @version      1.11.1
 // @description  Reports your Nexus Legacy fleet positions to the NexStar map, and answers the map's fuel-estimate and own-planet logistics requests. Your session token never leaves your browser. SECURITY: hosted from a public branch-protected GitHub repo, no silent auto-update; the map can only run self-owned actions (transfers, colony builds) without an in-game confirm.
 // @match        https://s0.nexuslegacy.space/*
 // @match        https://nexstar.nexusnavigators.us/*
@@ -719,8 +719,12 @@
     if (!owned.has(pid)) return Promise.reject(new Error('planet not owned — build refused'));
     const d = await gget('/api/planets/' + pid);
     const slot = ((d && d.buildings) || []).find(x => x && x.definition && x.definition.key === key);
-    if (!slot || slot.id == null) return Promise.reject(new Error('no building slot for "' + key + '"'));
-    const endpoint = '/api/buildings/planets/' + pid + '/buildings/' + slot.id + '/upgrade';
+    // The upgrade route keys on the building DEFINITION id (a small per-type id,
+    // e.g. 6) under buildings[].definition.id — NOT the building instance/row id
+    // (buildings[].id, which can be 5-digit). Verified live on s0, 2026-07-12.
+    const defId = slot && slot.definition && slot.definition.id;
+    if (defId == null) return Promise.reject(new Error('no building definition id for "' + key + '"'));
+    const endpoint = '/api/buildings/planets/' + pid + '/buildings/' + defId + '/upgrade';
     if (!/^\/api\/buildings\/planets\/\d+\/buildings\/\d+\/upgrade$/.test(endpoint))
       return Promise.reject(new Error('endpoint not allowed'));   // defense in depth
     return gamePost(endpoint, null);   // bodyless POST
