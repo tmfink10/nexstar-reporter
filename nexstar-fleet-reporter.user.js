@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         NexStar Fleet Reporter
 // @namespace    https://nexusnavigators.us/
-// @version      1.11.1
+// @version      1.12.0
 // @description  Reports your Nexus Legacy fleet positions to the NexStar map, and answers the map's fuel-estimate and own-planet logistics requests. Your session token never leaves your browser. SECURITY: hosted from a public branch-protected GitHub repo, no silent auto-update; the map can only run self-owned actions (transfers, colony builds) without an in-game confirm.
 // @match        https://s0.nexuslegacy.space/*
 // @match        https://nexstar.nexusnavigators.us/*
@@ -730,9 +730,50 @@
     return gamePost(endpoint, null);   // bodyless POST
   }
 
+  // ── Colony ship building (viewer shipyard planner, v1.12) ──────────────────
+  // shipyard-info: live buildable-ship list for a colony (the report only carries
+  // the ACTIVE queue, not the catalog). Filtered to what can actually be built
+  // here (available && researchMet && shipyardMet) and to colony yards (Planetary
+  // / Orbital — Moon Dockyard is moon-only). Costs are FINAL per-unit values.
+  function _shipCost(s) {
+    const c = {};
+    if (+s.costOre) c.ore = +s.costOre;
+    if (+s.costSilicates) c.silicates = +s.costSilicates;
+    if (+s.costHydrogen) c.hydrogen = +s.costHydrogen;
+    if (+s.costAlloys) c.alloys = +s.costAlloys;
+    Object.entries(s.rareCosts || {}).forEach(([k, v]) => { if (+v) c[k] = +v; });
+    return c;
+  }
+  async function shipyardInfo(req) {
+    const pid = +((req || {}).planetId);
+    if (!pid) return Promise.reject(new Error('bad shipyard-info request'));
+    const d = await gget('/api/planets/' + pid + '/shipyard');
+    const yard = { 'Planetary Shipyard': 'planetary', 'Orbital Shipyard': 'orbital' };
+    const ships = ((d && d.ships) || [])
+      .filter(s => s && s.available && s.researchMet && s.shipyardMet && yard[s.shipyardName])
+      .map(s => ({ id: s.id, key: s.key, name: s.name, yard: yard[s.shipyardName],
+                   cost: _shipCost(s), buildTime: +s.buildTime || 0, sortOrder: +s.sortOrder || 0 }));
+    return { ships, planetaryActive: !!(d && d.planetaryQueue), orbitalActive: !!(d && d.orbitalQueue),
+             maxQueueSize: (d && d.maxQueueSize) || 0 };
+  }
+  // ship-build: POST the shipyard build. Self-owned planets only; the endpoint is
+  // regex-pinned; body is { shipDefId, quantity } (shipDefId = ships[].id).
+  async function shipBuild(req) {
+    const b = req || {};
+    const pid = +b.planetId, shipDefId = +b.shipDefId;
+    const quantity = Math.max(1, Math.floor(+b.quantity || 1));
+    if (!pid || !shipDefId) return Promise.reject(new Error('bad ship-build request'));
+    const owned = await ownedPlanetIds();
+    if (!owned.has(pid)) return Promise.reject(new Error('planet not owned — build refused'));
+    const endpoint = '/api/planets/' + pid + '/shipyard/build';
+    if (!/^\/api\/planets\/\d+\/shipyard\/build$/.test(endpoint))
+      return Promise.reject(new Error('endpoint not allowed'));   // defense in depth
+    return gamePost(endpoint, { shipDefId, quantity });
+  }
+
   const RPC = { 'fuel-estimate': fuelEstimate, 'launch-mission': launchMission, 'recall-mission': recallMission,
                 'planet-info': planetInfo, 'explore-scan': exploreScan, 'explore-dispatch': exploreDispatch,
-                'build-upgrade': buildUpgrade };
+                'build-upgrade': buildUpgrade, 'shipyard-info': shipyardInfo, 'ship-build': shipBuild };
 
   window.addEventListener('message', async (ev) => {
     const d = ev.data;
