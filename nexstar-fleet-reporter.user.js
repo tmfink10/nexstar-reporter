@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         NexStar Fleet Reporter
 // @namespace    https://nexusnavigators.us/
-// @version      1.14.0
+// @version      1.15.0
 // @description  Reports your Nexus Legacy fleet positions to the NexStar map, and answers the map's fuel-estimate and own-planet logistics requests. Your session token never leaves your browser. SECURITY: hosted from a public branch-protected GitHub repo, no silent auto-update; the map can only run self-owned actions (transfers, colony builds) without an in-game confirm.
 // @match        https://s0.nexuslegacy.space/*
 // @match        https://nexstar.nexusnavigators.us/*
@@ -614,7 +614,11 @@
       return ((fd && fd.fleet) || [])
         .filter(s => s.definition && s.definition.shipClass === 'utility' && (s.definition.cargoCapacity || 0) > 0)
         .map(s => ({ shipType: s.definition.key, shipDefId: s.shipDefId, available: s.quantity,
-          cargo: Math.round(s.definition.cargoCapacity * (1 + (/shuttle/.test(s.definition.key || '') ? scb : cb))) }));
+          cargo: Math.round(s.definition.cargoCapacity * (1 + (/shuttle/.test(s.definition.key || '') ? scb : cb))),
+          // allowedCargo restricts what a hauler can carry (ore_freighter →
+          // ore/silicates, tanker → hydrogen; null = unrestricted). The map sizes
+          // salvage off only haulers that can carry the whole field. (v1.15)
+          allowedCargo: (s.definition.allowedCargo && s.definition.allowedCargo.length) ? s.definition.allowedCargo : null }));
     };
     const result = { planets: planets.map(p => {
       const base = { id: p.id, name: p.name, systemId: p.systemId, systemName: p.systemName,
