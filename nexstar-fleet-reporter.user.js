@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         NexStar Fleet Reporter
 // @namespace    https://nexusnavigators.us/
-// @version      1.15.0
+// @version      1.16.0
 // @description  Reports your Nexus Legacy fleet positions to the NexStar map, and answers the map's fuel-estimate and own-planet logistics requests. Your session token never leaves your browser. SECURITY: hosted from a public branch-protected GitHub repo, no silent auto-update; the map can only run self-owned actions (transfers, colony builds) without an in-game confirm.
 // @match        https://s0.nexuslegacy.space/*
 // @match        https://nexstar.nexusnavigators.us/*
@@ -115,6 +115,125 @@
     return false;
   }
 
+  // ==US-ENGINE-START== pure decision logic — no GM_*, no fetch, no closures.
+  // Extracted verbatim by tests/userscript_engine.mjs and EXECUTED, so the
+  // security allowlist and the slimmers are behavior-tested, not just
+  // regex-pinned (review finding F22).
+
+  // Data minimization: the report only needs WHO you are and WHERE your
+  // planets are. Never forward account details (email, Steam id, vacation
+  // and billing state, …) to the map server.
+  function slimMe(me) {
+    return {
+      user: { id: ((me && me.user) || {}).id, username: ((me && me.user) || {}).username },
+      planets: (me && me.planets) || [],
+    };
+  }
+
+  // Building DEFINITIONS are static game data — the frequent planetInfos carry
+  // a deny-listed copy: every dynamic field survives, only the definition
+  // bloat is slimmed to {key, name}.
+  function slimPlanetInfo(d) {
+    const buildings = ((d && d.buildings) || [])
+      .filter(b => b && ((b.level || 0) > 0 || b.isUpgrading))
+      .map(b => Object.assign({}, b, {
+        definition: { key: (b.definition || {}).key, name: (b.definition || {}).name },
+      }));
+    return { planet: (d && d.planet) || null, buildings };
+  }
+
+  // /api/planets/{id}/shipyard: planetaryQueue/orbitalQueue are each a SINGLE
+  // object (the currently active build) or null; planetaryQueueAll/orbitalQueueAll
+  // carry the FULL per-yard queue (active first, then pending — each with its own
+  // `id` for cancel), and maxQueueSize is the cap (active + pending). Verified live
+  // 2026-07-10 (single active) / 2026-07-12 (queue + ids). We keep the game's raw
+  // field names in the slim copy so the server-side parse_shipyard_queue handles
+  // this slim body and a direct game body identically.
+  function slimShipyard(d) {
+    // Full queue entry (active or pending). Pending entries legitimately carry
+    // null startsAt/endsAt until they become active, so tolerate missing timing.
+    const entry = (q) => (q && q.id != null && q.shipKey) ? {
+      id: q.id, shipKey: q.shipKey, shipName: q.shipName || null, quantity: q.quantity || 1,
+      startsAt: q.startsAt || null, endsAt: q.endsAt || null,
+      isRepair: !!q.isRepair, status: q.status || null,
+    } : null;
+    // Active-summary object (the old shape the console's summary card reads),
+    // now also carrying `id`.
+    const one = (q) => (q && q.shipKey) ? {
+      id: (q.id != null ? q.id : null), shipKey: q.shipKey, shipName: q.shipName,
+      quantity: q.quantity || 1, startsAt: q.startsAt, endsAt: q.endsAt, isRepair: !!q.isRepair,
+    } : null;
+    const arr = (a) => Array.isArray(a) ? a.map(entry).filter(Boolean) : [];
+    const planetaryQueue = one(d && d.planetaryQueue);
+    const orbitalQueue = one(d && d.orbitalQueue);
+    const planetaryQueueAll = arr(d && d.planetaryQueueAll);
+    const orbitalQueueAll = arr(d && d.orbitalQueueAll);
+    const maxQueueSize = (d && +d.maxQueueSize) || 0;
+    const any = planetaryQueue || orbitalQueue || planetaryQueueAll.length || orbitalQueueAll.length;
+    return any ? { planetaryQueue, orbitalQueue, planetaryQueueAll, orbitalQueueAll, maxQueueSize } : null;
+  }
+
+  // Own mining outposts: only the fields the map's Empire Console shows —
+  // construction job ids, relocation state, rename cooldowns etc. never leave
+  // the browser (data minimization, same policy as slimMe).
+  const OUTPOST_RES_KEYS = ['ore', 'silicates', 'hydrogen', 'alloys', 'cryoIce',
+                            'quantumDust', 'plasmaCore', 'bioExtract', 'darkMatter'];
+  function slimOutpost(o) {
+    if (!o || o.id == null) return null;
+    const f = o.asteroidField || {};
+    const resources = {}, rates = {};
+    OUTPOST_RES_KEYS.forEach(k => {
+      if (+o[k] > 0) resources[k] = +o[k];
+      if (+o[k + 'Rate'] > 0) rates[k] = +o[k + 'Rate'];
+    });
+    return {
+      id: o.id, name: o.name, level: o.level, systemId: o.systemId,
+      resources, rates,
+      basicStorage: o.basicStorage, rareStorage: o.rareStorage,
+      hp: o.hp, maxHp: o.maxHp, shieldHp: o.shieldHp, shieldMaxHp: o.shieldMaxHp,
+      deployedShipCount: o.deployedShipCount,
+      isConstructing: !!o.isConstructing,
+      constructionEndsAt: o.constructionEndsAt || null,
+      pendingBuildingKey: o.pendingBuildingKey || null,
+      buildings: (o.buildings || []).map(b => ({ key: b && (b.buildingKey || b.key), level: (b && b.level) || 0 })),
+      field: { id: f.id, name: f.name, fieldType: f.fieldType, richness: f.richness,
+               totalResources: f.totalResources, remainingResources: f.remainingResources },
+    };
+  }
+
+  // SECURITY: the Ops-dispatch allowlist is the EXACT set of Ops endpoints,
+  // NOT a broad /api/fleet/* pattern. The old wildcard let a compromised map
+  // reach /api/fleet/dispatch (attack another player / gift your resources)
+  // through this channel. Adding a genuinely new Ops job type is the one
+  // thing that needs a userscript bump — a deliberate, reviewable trade.
+  const EXPLORE_DISPATCH_OK = [
+    /^\/api\/fleet\/survey$/, /^\/api\/fleet\/collect-debris$/, /^\/api\/fleet\/attack-pirates$/,
+    /^\/api\/fleet\/wormhole-run$/, /^\/api\/fleet\/investigate$/, /^\/api\/fleet\/mine$/,
+    /^\/api\/planets\/\d+\/shipyard\/repair$/,
+  ];
+  // → error string (veto) or null (all calls allowed).
+  function exploreCallsAllowed(calls) {
+    if (!Array.isArray(calls) || !calls.length) return 'no dispatch calls';
+    for (const c of calls) {
+      if (!c || typeof c.endpoint !== 'string' || !EXPLORE_DISPATCH_OK.some(re => re.test(c.endpoint)))
+        return 'endpoint not allowed: ' + (c && c.endpoint);
+    }
+    return null;
+  }
+
+  // The upgrade/cancel routes key on the building DEFINITION id (a small
+  // per-type id, e.g. 6) under buildings[].definition.id — NOT the building
+  // instance/row id (buildings[].id, which can be 5-digit). Verified live on
+  // s0, 2026-07-12; regression-pinned by tests/userscript_engine.mjs.
+  // → the endpoint string, or null when the inputs don't form an allowed route.
+  function buildingActionEndpoint(planetId, definitionId, action) {
+    const ep = '/api/buildings/planets/' + planetId + '/buildings/' + definitionId + '/' + action;
+    const ok = action === 'upgrade' ? /^\/api\/buildings\/planets\/\d+\/buildings\/\d+\/upgrade$/
+             : action === 'cancel'  ? /^\/api\/buildings\/planets\/\d+\/buildings\/\d+\/cancel$/ : null;
+    return (ok && ok.test(ep)) ? ep : null;
+  }
+  // ==US-ENGINE-END==
+
   // Fetch the published @version. Returns the version string, or null on failure.
   function fetchLatestVersion() {
     return new Promise((resolve) => {
@@ -143,6 +262,11 @@
   }
 
   GM_registerMenuCommand('Check for updates', () => checkForUpdate(true));
+  // Update DISCOVERY is passive without these (F44): check shortly after load
+  // and every 24h in long-lived tabs. Still no auto-INSTALL — the update
+  // screen only opens after an explicit confirm (see the security policy).
+  setTimeout(() => checkForUpdate(false), 60 * 1000);
+  setInterval(() => checkForUpdate(false), 24 * 60 * 60 * 1000);
 
   const sleep = (ms) => new Promise(r => setTimeout(r, ms));
 
@@ -210,45 +334,7 @@
   const BUILDING_CATALOG_TTL_MS = 24 * 60 * 60 * 1000;
   let _planetInfoCache = { at: 0, data: {} };
   let _shipyardCache = { at: 0, data: {} };
-  function slimPlanetInfo(d) {
-    const buildings = ((d && d.buildings) || [])
-      .filter(b => b && ((b.level || 0) > 0 || b.isUpgrading))
-      .map(b => Object.assign({}, b, {
-        definition: { key: (b.definition || {}).key, name: (b.definition || {}).name },
-      }));
-    return { planet: (d && d.planet) || null, buildings };
-  }
-  // /api/planets/{id}/shipyard: planetaryQueue/orbitalQueue are each a SINGLE
-  // object (the currently active build) or null; planetaryQueueAll/orbitalQueueAll
-  // carry the FULL per-yard queue (active first, then pending — each with its own
-  // `id` for cancel), and maxQueueSize is the cap (active + pending). Verified live
-  // 2026-07-10 (single active) / 2026-07-12 (queue + ids). We keep the game's raw
-  // field names in the slim copy so the server-side parse_shipyard_queue handles
-  // this slim body and a direct game body identically. Entry `id` rides along now
-  // — it's needed to cancel a specific queued build.
-  function slimShipyard(d) {
-    // Full queue entry (active or pending). Pending entries legitimately carry
-    // null startsAt/endsAt until they become active, so tolerate missing timing.
-    const entry = (q) => (q && q.id != null && q.shipKey) ? {
-      id: q.id, shipKey: q.shipKey, shipName: q.shipName || null, quantity: q.quantity || 1,
-      startsAt: q.startsAt || null, endsAt: q.endsAt || null,
-      isRepair: !!q.isRepair, status: q.status || null,
-    } : null;
-    // Active-summary object (the old shape the console's summary card reads),
-    // now also carrying `id`.
-    const one = (q) => (q && q.shipKey) ? {
-      id: (q.id != null ? q.id : null), shipKey: q.shipKey, shipName: q.shipName,
-      quantity: q.quantity || 1, startsAt: q.startsAt, endsAt: q.endsAt, isRepair: !!q.isRepair,
-    } : null;
-    const arr = (a) => Array.isArray(a) ? a.map(entry).filter(Boolean) : [];
-    const planetaryQueue = one(d && d.planetaryQueue);
-    const orbitalQueue = one(d && d.orbitalQueue);
-    const planetaryQueueAll = arr(d && d.planetaryQueueAll);
-    const orbitalQueueAll = arr(d && d.orbitalQueueAll);
-    const maxQueueSize = (d && +d.maxQueueSize) || 0;
-    const any = planetaryQueue || orbitalQueue || planetaryQueueAll.length || orbitalQueueAll.length;
-    return any ? { planetaryQueue, orbitalQueue, planetaryQueueAll, orbitalQueueAll, maxQueueSize } : null;
-  }
+  // slimPlanetInfo / slimShipyard live in the ==US-ENGINE== block above.
   // Building levels + shipyard queues share the same 5-minute cache — both
   // change slowly enough that a live countdown ticking client-side (from the
   // endsAt each carries) covers the gap between refreshes.
@@ -288,35 +374,7 @@
     return { infos: out, catalog: catalog.length ? catalog : null, shipyards };
   }
 
-  // Own mining outposts (/api/outposts): level, module levels, stored
-  // resources + rates, and the asteroid field being worked. Slimmed
-  // client-side (data minimization, same policy as `me`): only the fields the
-  // map's Empire Console shows — construction job ids, relocation state,
-  // rename cooldowns etc. never leave the browser.
-  const OUTPOST_RES_KEYS = ['ore', 'silicates', 'hydrogen', 'alloys', 'cryoIce',
-                            'quantumDust', 'plasmaCore', 'bioExtract', 'darkMatter'];
-  function slimOutpost(o) {
-    if (!o || o.id == null) return null;
-    const f = o.asteroidField || {};
-    const resources = {}, rates = {};
-    OUTPOST_RES_KEYS.forEach(k => {
-      if (+o[k] > 0) resources[k] = +o[k];
-      if (+o[k + 'Rate'] > 0) rates[k] = +o[k + 'Rate'];
-    });
-    return {
-      id: o.id, name: o.name, level: o.level, systemId: o.systemId,
-      resources, rates,
-      basicStorage: o.basicStorage, rareStorage: o.rareStorage,
-      hp: o.hp, maxHp: o.maxHp, shieldHp: o.shieldHp, shieldMaxHp: o.shieldMaxHp,
-      deployedShipCount: o.deployedShipCount,
-      isConstructing: !!o.isConstructing,
-      constructionEndsAt: o.constructionEndsAt || null,
-      pendingBuildingKey: o.pendingBuildingKey || null,
-      buildings: (o.buildings || []).map(b => ({ key: b && (b.buildingKey || b.key), level: (b && b.level) || 0 })),
-      field: { id: f.id, name: f.name, fieldType: f.fieldType, richness: f.richness,
-               totalResources: f.totalResources, remainingResources: f.remainingResources },
-    };
-  }
+  // slimOutpost lives in the ==US-ENGINE== block above.
 
   let running = false;
   let runStartedAt = 0;
@@ -403,13 +461,9 @@
       // catalog at most once per 24h — see planetInfos.
       const pi = await planetInfos(planets);
 
-      // Data minimization: the report only needs WHO you are and WHERE your
-      // planets are. Never forward account details (email, Steam id, vacation
-      // and billing state, …) to the map server.
-      const meSlim = {
-        user: { id: ((me && me.user) || {}).id, username: ((me && me.user) || {}).username },
-        planets: (me && me.planets) || [],
-      };
+      // Data minimization — slimMe (US-ENGINE block) forwards only identity +
+      // planet locations, never account details (email, Steam id, billing, …).
+      const meSlim = slimMe(me);
 
       const scriptVersion = (typeof GM_info !== 'undefined' && GM_info.script && GM_info.script.version) || null;
       const payload = { me: meSlim, planetFleets, planetInfos: pi.infos, missions, maxFleetSlots,
@@ -699,27 +753,15 @@
   }
 
   // Dispatch the chosen Ops job. The viewer passes the exact call(s) to make:
-  // { calls: [{ endpoint, body }, ...] } (repair sends several).
-  // SECURITY: the allowlist is the EXACT set of Ops endpoints, NOT a broad
-  // /api/fleet/* pattern. The old wildcard let a compromised map reach
-  // /api/fleet/dispatch (i.e. attack another player or gift your resources away)
-  // through this channel; these regexes deny that. Adding a genuinely new Ops
-  // job type is the one thing that now needs a userscript bump — a deliberate,
-  // reviewable trade for closing the backdoor.
-  const EXPLORE_DISPATCH_OK = [
-    /^\/api\/fleet\/survey$/, /^\/api\/fleet\/collect-debris$/, /^\/api\/fleet\/attack-pirates$/,
-    /^\/api\/fleet\/wormhole-run$/, /^\/api\/fleet\/investigate$/, /^\/api\/fleet\/mine$/,
-    /^\/api\/planets\/\d+\/shipyard\/repair$/,
-  ];
+  // { calls: [{ endpoint, body }, ...] } (repair sends several). The security
+  // allowlist (EXPLORE_DISPATCH_OK + exploreCallsAllowed) lives in the
+  // ==US-ENGINE== block above, where tests execute it.
   function exploreDispatch(req) {
     const b = req || {};
     const calls = Array.isArray(b.calls) ? b.calls
       : (b.endpoint ? [{ endpoint: b.endpoint, body: b.body }] : []);
-    if (!calls.length) return Promise.reject(new Error('no dispatch calls'));
-    for (const c of calls) {
-      if (!c || typeof c.endpoint !== 'string' || !EXPLORE_DISPATCH_OK.some(re => re.test(c.endpoint)))
-        return Promise.reject(new Error('endpoint not allowed: ' + (c && c.endpoint)));
-    }
+    const veto = exploreCallsAllowed(calls);
+    if (veto) return Promise.reject(new Error(veto));
     return Promise.all(calls.map(c => gamePost(c.endpoint, c.body || {})))
       .then(results => (results.length === 1 ? results[0] : { results }));
   }
@@ -742,14 +784,11 @@
     if (!owned.has(pid)) return Promise.reject(new Error('planet not owned — build refused'));
     const d = await gget('/api/planets/' + pid);
     const slot = ((d && d.buildings) || []).find(x => x && x.definition && x.definition.key === key);
-    // The upgrade route keys on the building DEFINITION id (a small per-type id,
-    // e.g. 6) under buildings[].definition.id — NOT the building instance/row id
-    // (buildings[].id, which can be 5-digit). Verified live on s0, 2026-07-12.
+    // DEFINITION id, not instance id — see buildingActionEndpoint (US-ENGINE).
     const defId = slot && slot.definition && slot.definition.id;
     if (defId == null) return Promise.reject(new Error('no building definition id for "' + key + '"'));
-    const endpoint = '/api/buildings/planets/' + pid + '/buildings/' + defId + '/upgrade';
-    if (!/^\/api\/buildings\/planets\/\d+\/buildings\/\d+\/upgrade$/.test(endpoint))
-      return Promise.reject(new Error('endpoint not allowed'));   // defense in depth
+    const endpoint = buildingActionEndpoint(pid, defId, 'upgrade');
+    if (!endpoint) return Promise.reject(new Error('endpoint not allowed'));   // defense in depth
     return gamePost(endpoint, null);   // bodyless POST
   }
 
@@ -769,9 +808,8 @@
     const slot = ((d && d.buildings) || []).find(x => x && x.definition && x.definition.key === key);
     const defId = slot && slot.definition && slot.definition.id;
     if (defId == null) return Promise.reject(new Error('no building definition id for "' + key + '"'));
-    const endpoint = '/api/buildings/planets/' + pid + '/buildings/' + defId + '/cancel';
-    if (!/^\/api\/buildings\/planets\/\d+\/buildings\/\d+\/cancel$/.test(endpoint))
-      return Promise.reject(new Error('endpoint not allowed'));   // defense in depth
+    const endpoint = buildingActionEndpoint(pid, defId, 'cancel');
+    if (!endpoint) return Promise.reject(new Error('endpoint not allowed'));   // defense in depth
     return gamePost(endpoint, null);   // bodyless POST
   }
 
@@ -842,6 +880,7 @@
                 'build-upgrade': buildUpgrade, 'build-cancel': buildCancel, 'shipyard-info': shipyardInfo,
                 'ship-build': shipBuild, 'ship-cancel': shipCancel };
 
+  const _winHandled = new Map();   // window-path request id -> reply (dedup, F40)
   window.addEventListener('message', async (ev) => {
     const d = ev.data;
     if (!d || d.source !== 'nexstar-viewer' || !okOrigin(ev.origin)) return;   // only our viewer, only trusted origins
@@ -849,11 +888,30 @@
       try { ev.source.postMessage(Object.assign({ source: 'nexstar-relay', id: d.id }, msg), ev.origin); }
       catch (e) { /* source/window gone */ }
     };
-    if (d.kind === 'ping') { reply({ kind: 'pong' }); return; }   // readiness probe (covers a missed 'ready')
-    if (RPC[d.kind]) {
-      try { reply({ kind: d.kind + '-result', ok: true, data: await RPC[d.kind](d.body) }); }
-      catch (e) { reply({ kind: d.kind + '-result', ok: false, error: String((e && e.message) || e) }); }
+    // Pong carries the script version (v1.16+): the viewer's RPC_MIN_VER
+    // handshake reads it to fail fast instead of timing out (F13/F37).
+    if (d.kind === 'ping') { reply({ kind: 'pong', version: CUR_VERSION }); return; }
+    if (!RPC[d.kind]) {
+      // Old scripts dropped unknown kinds silently — the viewer saw a
+      // misleading 20s "not logged in" timeout. Say what's actually wrong.
+      if (d.id) reply({ kind: d.kind + '-result', ok: false,
+        error: 'reporter v' + CUR_VERSION + ' does not support "' + d.kind + '" — update the reporter userscript' });
+      return;
     }
+    // Resend nudges must not re-RUN a mutation (F40: recall-mission could
+    // re-fire every 700ms): first arrival executes; duplicates get the cached
+    // reply, or nothing while the original is still in flight (it will reply).
+    if (d.id && _winHandled.has(d.id)) {
+      const cached = _winHandled.get(d.id);
+      if (cached) reply(cached);
+      return;
+    }
+    if (d.id) _winHandled.set(d.id, null);   // in-flight marker
+    let msg;
+    try { msg = { kind: d.kind + '-result', ok: true, data: await RPC[d.kind](d.body) }; }
+    catch (e) { msg = { kind: d.kind + '-result', ok: false, error: String((e && e.message) || e) }; }
+    if (d.id) { _winHandled.set(d.id, msg); setTimeout(() => _winHandled.delete(d.id), 60000); }
+    reply(msg);
   });
 
   // ── GM-bridge server (game side) ────────────────────────────────────────────
@@ -865,26 +923,57 @@
   function claimLeader() {
     try {
       const l = GM_getValue('nx_leader', null);
-      if (!l || l.id === TAB_ID || Date.now() - l.ts > LEADER_TTL) GM_setValue('nx_leader', { id: TAB_ID, ts: Date.now() });
+      if (!l || l.id === TAB_ID || Date.now() - l.ts > LEADER_TTL) {
+        const wasLeader = !!l && l.id === TAB_ID;
+        GM_setValue('nx_leader', { id: TAB_ID, ts: Date.now() });
+        if (!wasLeader) {
+          // Just took over. A one-shot command dropped during the no-leader
+          // window (old leader closed/reloaded, TTL not yet expired) would
+          // otherwise vanish into a timeout (F16) — pick it up if still
+          // fresh. Deferred a tick so boot-time claims run after the RPC
+          // table exists.
+          const req = GM_getValue('nx_req', null);
+          if (req && req.ts && Date.now() - req.ts < 20000) setTimeout(() => handleGmReq(req), 0);
+        }
+      }
     } catch (e) { /* */ }
   }
   claimLeader();
   setInterval(claimLeader, 5000);
   const amLeader = () => { const l = GM_getValue('nx_leader', null); return !!l && l.id === TAB_ID; };
   const _gmHandled = new Set();   // request ids this tab already ran (resend nudges)
-  GM_addValueChangeListener('nx_req', async (k, o, req) => {
-    if (!req || !req.id || !req.kind || !amLeader()) return;
+  async function handleGmReq(req) {
+    if (!req || !req.id || !req.kind) return;
     const respond = (msg) => {
       GM_setValue('nx_res_' + req.id, Object.assign({ id: req.id }, msg));
       setTimeout(() => { try { GM_deleteValue('nx_res_' + req.id); } catch (e) { /* */ } }, 30000);
     };
-    if (req.kind === 'ping') { respond({ kind: 'pong', ok: true }); return; }
-    if (!RPC[req.kind] || _gmHandled.has(req.id)) return;
+    // Ping is answered by EVERY game tab, leader or not: the probe means "does
+    // a game tab exist", and the old leader-gated pong went silent during
+    // leader-election gaps — the viewer showed no link right after a game-tab
+    // reload (F16). Duplicate pongs collapse onto the same nx_res_<id> key.
+    // Carries the version for the viewer's RPC_MIN_VER handshake (F13/F37).
+    if (req.kind === 'ping') { respond({ kind: 'pong', ok: true, version: CUR_VERSION }); return; }
+    if (!amLeader() || _gmHandled.has(req.id)) return;
     _gmHandled.add(req.id);
     setTimeout(() => _gmHandled.delete(req.id), 60000);
-    try { respond({ kind: req.kind + '-result', ok: true, data: await RPC[req.kind](req.body) }); }
-    catch (e) { respond({ kind: req.kind + '-result', ok: false, error: String((e && e.message) || e) }); }
-  });
+    let msg;
+    if (!RPC[req.kind]) {
+      // Old scripts dropped unknown kinds silently — misleading 20s timeout
+      // viewer-side. Reply with what's actually wrong instead.
+      msg = { kind: req.kind + '-result', ok: false,
+              error: 'reporter v' + CUR_VERSION + ' does not support "' + req.kind + '" — update the reporter userscript' };
+    } else {
+      try { msg = { kind: req.kind + '-result', ok: true, data: await RPC[req.kind](req.body) }; }
+      catch (e) { msg = { kind: req.kind + '-result', ok: false, error: String((e && e.message) || e) }; }
+    }
+    respond(msg);
+    // Exactly-once across tab reloads: _gmHandled is in-memory only, so a NEW
+    // leader (this tab reloaded, or a handoff pickup) must not find and
+    // re-run an already-answered request — clear it from script storage.
+    try { GM_deleteValue('nx_req'); } catch (e) { /* */ }
+  }
+  GM_addValueChangeListener('nx_req', (k, o, req) => { handleGmReq(req); });
 
   announceReady();
 })();
