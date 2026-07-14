@@ -18,26 +18,43 @@ authenticated by a personal key you get from the Discord bot.
 ## Updating
 
 There is **no silent auto-update** (see Security). The script checks the
-published version and, when a new one exists, shows a **"⬆ Update"** item in the
-Tampermonkey menu — clicking it opens this install page so you can review and
-install the new version yourself.
+published version shortly after a game tab loads and every 24 hours (and on
+demand via the Tampermonkey menu → **Check for updates**); when a newer version
+exists it *asks* before opening this install page — installing is always your
+explicit click, where you can review the diff first.
 
 ## Security
 
 This script runs on the game origin with your live session, so its update and
 write behavior is deliberately locked down:
 
-- **Hosted here, on a public branch-protected GitHub repo** — not on the map's
-  server. Every version is a reviewed git commit; a compromise of the map's VPS
-  cannot change what you install or run.
+- **Hosted here, on a public GitHub repo** — not on the map's server. Every
+  version is a reviewed git commit; a compromise of the map's VPS cannot change
+  what you install or run.
 - **No silent auto-update.** `@updateURL`/`@downloadURL` are intentionally
   absent, so nothing can background-install new code. Updates are a deliberate,
   reviewable act.
-- **Writes are gated.** Only a transfer/deliver to one of *your own* planets runs
-  without a prompt. Anything else — hostile, off-target, gift, garrison, spy, or
-  a move to a moon — requires an explicit confirmation **in the game tab** and
-  fails closed if it can't be shown. So even a compromised map can only *ask*;
-  only you can approve a dangerous action.
+- **Writes the map can trigger fall into three tiers:**
+  1. **Confirm-free, self-owned logistics** — a transfer/deliver to one of
+     *your own* planets.
+  2. **Confirm-free, allowlisted Ops** — exactly these endpoints and nothing
+     else: `survey`, `collect-debris`, `attack-pirates` (pirate camps),
+     `wormhole-run`, `investigate`, `mine`, and shipyard `repair` on your own
+     planet — plus colony building upgrade/cancel and ship build/cancel, which
+     are refused outright on planets you don't own. These act only on your own
+     assets or neutral PvE objects; the allowlist is a set of exact-match
+     patterns (no `/api/fleet/*` wildcard), so the map cannot reach
+     `/api/fleet/dispatch`, attacks on players, or gifts through this channel.
+     The allowlist is executed against hostile inputs by the map repo's test
+     suite on every commit.
+  3. **Everything else** — hostile, off-target, gift, garrison, spy, or a move
+     to a moon — requires an explicit confirmation **in the game tab** and
+     fails closed if it can't be shown. A compromised map can only *ask*;
+     only you can approve a dangerous action.
+- **Data minimization.** Reports carry your identity (id + username), planets,
+  fleets, missions, and spy/battle intel — never account details (email, Steam
+  id, billing/vacation state), which are stripped before anything leaves the
+  browser.
 
 If you can read code, you're encouraged to skim the script before installing —
 that's the point of hosting it in the open.
