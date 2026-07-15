@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         NexStar Fleet Reporter
 // @namespace    https://nexusnavigators.us/
-// @version      1.18.0
+// @version      1.18.1
 // @description  Reports your Nexus Legacy fleet positions to the NexStar map, and answers the map's fuel-estimate and own-planet logistics requests. Your session token never leaves your browser. SECURITY: hosted from a public branch-protected GitHub repo, no silent auto-update; the map can only run self-owned actions (transfers, colony builds) without an in-game confirm.
 // @match        https://s0.nexuslegacy.space/*
 // @match        https://nexstar.nexusnavigators.us/*
@@ -890,10 +890,14 @@
     return gamePost(endpoint, { shipDefId, quantity });
   }
   // ship-cancel: cancel one queued/active shipyard build by its queue-entry id
-  // (POST /shipyard/cancel/{queueId}, 100% refunded to your OWN colony). The id
-  // comes from the report's queue entries — no slot resolution needed. Self-owned
-  // planets only, endpoint regex-pinned; a refund can't touch anyone else, so it
-  // stays in the safe self-action tier (no in-game confirm), like build-cancel.
+  // (POST /shipyard/cancel/{queueId} — refunds 100% for a queued build, 90% for
+  // the active one, to your OWN colony). The id comes from the report's queue
+  // entries — no slot resolution needed. Self-owned planets only, endpoint
+  // regex-pinned; a refund can't touch anyone else, so it stays in the safe
+  // self-action tier (no in-game confirm), like build-cancel.
+  // The POST is BODYLESS (v1.18.1): the game's own UI sends content-length 0
+  // (live capture 2026-07-15), and with a JSON `{}` body the game answered 200
+  // WITHOUT cancelling — same trap as the building-cancel route.
   async function shipCancel(req) {
     const b = req || {};
     const pid = +b.planetId, queueId = +b.queueId;
@@ -903,7 +907,7 @@
     const endpoint = '/api/planets/' + pid + '/shipyard/cancel/' + queueId;
     if (!/^\/api\/planets\/\d+\/shipyard\/cancel\/\d+$/.test(endpoint))
       return Promise.reject(new Error('endpoint not allowed'));   // defense in depth
-    return gamePost(endpoint, {});   // empty body
+    return gamePost(endpoint, null);   // BODYLESS — content-length 0, like the game UI
   }
 
   const RPC = { 'fuel-estimate': fuelEstimate, 'launch-mission': launchMission, 'recall-mission': recallMission,
