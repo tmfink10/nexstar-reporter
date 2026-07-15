@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         NexStar Fleet Reporter
 // @namespace    https://nexusnavigators.us/
-// @version      1.17.0
+// @version      1.18.0
 // @description  Reports your Nexus Legacy fleet positions to the NexStar map, and answers the map's fuel-estimate and own-planet logistics requests. Your session token never leaves your browser. SECURITY: hosted from a public branch-protected GitHub repo, no silent auto-update; the map can only run self-owned actions (transfers, colony builds) without an in-game confirm.
 // @match        https://s0.nexuslegacy.space/*
 // @match        https://nexstar.nexusnavigators.us/*
@@ -694,6 +694,23 @@
       if (want('salvage')) base.haulers = haulersFor(fleetByPlanet[p.id]);
       return base;
     }) };
+
+    // v1.18: the fleets-out counter, captured live at scan time. Mirrors the
+    // report path's server-side rule (_count_active_missions in collector.py):
+    // EVERY mission still holding a slot counts — until its returnArrivesAt is
+    // in the past — regardless of type or composition. Rides the scan so the
+    // map's "N/M out" updates with every re-scan (incl. the automatic one
+    // ~10s after a fleet lands) instead of lagging the ~30s report cycle.
+    try {
+      const fm = await gget('/api/fleet/missions');
+      const nowMs = Date.now();
+      result.fleetsOut = ((fm && fm.missions) || []).filter(m => {
+        if (!m) return false;
+        const ra = m.returnArrivesAt ? +new Date(m.returnArrivesAt) : NaN;
+        return !(isFinite(ra) && nowMs > ra);   // already home — slot freed
+      }).length;
+      if (fm && fm.maxFleetSlots > 0) result.maxFleetSlots = fm.maxFleetSlots;
+    } catch (e) { /* counter data optional */ }
 
     if (want('salvage')) {
       result.debris = (await listOf('/api/fleet/system-debris', 'debris')).map(d => {
