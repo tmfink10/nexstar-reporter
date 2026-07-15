@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         NexStar Fleet Reporter
 // @namespace    https://nexusnavigators.us/
-// @version      1.16.0
+// @version      1.17.0
 // @description  Reports your Nexus Legacy fleet positions to the NexStar map, and answers the map's fuel-estimate and own-planet logistics requests. Your session token never leaves your browser. SECURITY: hosted from a public branch-protected GitHub repo, no silent auto-update; the map can only run self-owned actions (transfers, colony builds) without an in-game confirm.
 // @match        https://s0.nexuslegacy.space/*
 // @match        https://nexstar.nexusnavigators.us/*
@@ -652,14 +652,27 @@
     const me = await gget('/api/auth/me').catch(() => null);
     const planets = (me && me.planets) || [];
 
-    // Planet fleets power both salvage hauling (available cargo ships) and repair
-    // (damaged ships), so fetch each once when either job needs it.
+    // Planet fleets power salvage hauling (available cargo ships), repair
+    // (damaged ships), and — v1.17 — the per-planet OPERATIONAL ship counts the
+    // map's job gate reads, so a fleet that just landed can crew the next job
+    // immediately instead of waiting out the ~30s report cycle. Fetched once
+    // per planet for all three uses.
     const fleetByPlanet = {};
-    if (want('salvage') || want('repair')) {
-      for (const p of planets) {
-        try { fleetByPlanet[p.id] = await gget('/api/planets/' + p.id + '/fleet'); } catch (e) { /* skip */ }
-      }
+    for (const p of planets) {
+      try { fleetByPlanet[p.id] = await gget('/api/planets/' + p.id + '/fleet'); } catch (e) { /* skip */ }
     }
+    // Operational (undamaged, stationed) counts by ship key — the same
+    // availability the map's report path derives, but captured live at scan
+    // time. Data minimization: counts only, nothing else from the fleet.
+    const shipsFor = (fd) => {
+      const out = {};
+      ((fd && fd.fleet) || []).forEach(s => {
+        const key = s.definition && s.definition.key;
+        const op = (+s.quantity || 0) - (+s.damagedQuantity || 0);
+        if (key && op > 0) out[key] = (out[key] || 0) + op;
+      });
+      return out;
+    };
     // Utility cargo ships on hand, with EFFECTIVE hold size (base × research cargo
     // bonus; shuttles use the shuttle bonus). The viewer sizes a salvage pickup
     // from these, biggest holds first.
@@ -676,7 +689,8 @@
     };
     const result = { planets: planets.map(p => {
       const base = { id: p.id, name: p.name, systemId: p.systemId, systemName: p.systemName,
-                     systemX: p.systemX, systemY: p.systemY, isHomeworld: !!p.isHomeworld };
+                     systemX: p.systemX, systemY: p.systemY, isHomeworld: !!p.isHomeworld,
+                     ships: shipsFor(fleetByPlanet[p.id]) };
       if (want('salvage')) base.haulers = haulersFor(fleetByPlanet[p.id]);
       return base;
     }) };
