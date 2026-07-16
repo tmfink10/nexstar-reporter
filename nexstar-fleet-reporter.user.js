@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         NexStar Fleet Reporter
 // @namespace    https://nexusnavigators.us/
-// @version      1.21.0
+// @version      1.22.0
 // @description  Reports your Nexus Legacy fleet positions to the NexStar map, and answers the map's fuel-estimate and own-planet logistics requests. Your session token never leaves your browser. SECURITY: hosted from a public branch-protected GitHub repo, no silent auto-update; the map can only run self-owned actions (transfers, colony builds) without an in-game confirm.
 // @match        https://s0.nexuslegacy.space/*
 // @match        https://nexstar.nexusnavigators.us/*
@@ -252,6 +252,16 @@
     'Resturi', 'Roncsok', 'Skräp', 'Szczątki', 'Trosky', 'Trümmer',
     'Vraggods', 'Vrakrester', 'Συντρίμμια', 'Обломки', 'Отломки', 'Уламки',
     '残骸'];
+  const PIRATES_TAB_LABELS = ['Pirates', 'Piraten', 'Piratas', 'Pirater',
+    'Pirati', 'Piráti', 'Pirați', 'Piraci', 'Gusari', 'Kalózok',
+    'Merirosvot', 'Korsanlar', 'Πειρατές', 'Пираты', 'Пирати', 'Пірати',
+    '海盗'];
+  const WORMHOLES_TAB_LABELS = ['Wormholes', 'Wormhole', 'Wurmlöcher',
+    'Trous de ver', 'Agujeros de gusano', 'Buracos de Minhoca', 'Wormgaten',
+    'Červí díry', 'Červie diery', 'Črvine', 'Crvotočine', 'Féregjáratok',
+    'Găuri de Vierme', 'Madonreiät', 'Maskhål', 'Ormehull', 'Ormehuller',
+    'Solucan Delikleri', 'Tunele czasoprzestrzenne', 'Σκουληκότρυπες',
+    'Червееви дупки', 'Червоточини', 'Червоточины', '虫洞'];
   // → index of the tab whose (localized) label is in the set, or -1.
   function usPickFleetTab(labels, tabSet) {
     return (labels || []).findIndex(t => (tabSet || []).some(l => String(t || '').includes(l)));
@@ -327,6 +337,31 @@
     const want = String(systemName || '').trim().toLowerCase();
     if (!want) return -1;
     return (names || []).findIndex(n => String(n || '').trim().toLowerCase() === want);
+  }
+  // → index of the wormhole card for this job, or -1. Cards:
+  // [{name: "J-307465", system: "G24-14", cls: "C2", hasAction}]. The card
+  // name IS "J-" + the wormhole id (locale-proof) — match it first; fall back
+  // to system + class, then system alone. Cards without an enter button
+  // (already run / expired) never match.
+  function usPickWormholeCard(cards, wormholeId, systemName, whClass) {
+    const list = (cards || []).map((c, i) => ({ c: c || {}, i })).filter(x => x.c.hasAction);
+    const idName = wormholeId != null ? ('j-' + String(wormholeId).toLowerCase()) : null;
+    const sys = String(systemName || '').trim().toLowerCase();
+    const cls = String(whClass || '').trim().toLowerCase();
+    const norm = s => String(s || '').trim().toLowerCase();
+    let hit = idName ? list.find(x => norm(x.c.name) === idName) : null;
+    if (!hit && sys && cls) hit = list.find(x => norm(x.c.system) === sys && norm(x.c.cls) === cls);
+    if (!hit && sys) hit = list.find(x => norm(x.c.system) === sys);
+    return hit ? hit.i : -1;
+  }
+  // → index of the asteroid-field card for this field id, or -1. Cards:
+  // [{idText: "#146167", hasAction}] — the galaxy panel prints the numeric
+  // field id on every card (locale-proof, exact).
+  function usPickFieldCard(cards, fieldId) {
+    const want = '#' + String(fieldId || '').trim();
+    if (want === '#') return -1;
+    return (cards || []).findIndex(c => c && c.hasAction
+      && String(c.idText || '').trim() === want);
   }
   // ==US-ENGINE-END==
 
@@ -1148,43 +1183,40 @@
   // launch planet (the survey departs from whatever planet is focused), open
   // the target system's galaxy panel, and STOP. It must NEVER click
   // button.survey-btn. Selector contract: docs/game-actions/investigate-dom-map.md.
-  async function prefillSurvey(req) {
-    const b = req || {};
-    const systemName = String(b.systemName || '').trim();
-    const fromPlanet = String(b.fromPlanet || '').trim();
-    const fromSystem = String(b.fromSystem || '').trim();
-    if (!systemName || !fromPlanet) return Promise.reject(new Error('bad prefill request'));
-    // 1. Active planet — the survey's launch source (no in-form selector exists).
+  // Set the game's ACTIVE PLANET (the top-left switcher). Surveys launch from
+  // it, and the galaxy panel's mine button gates on it.
+  async function _pfSetActivePlanet(fromPlanet, fromSystem) {
     const curPlanet = () => {
       const el = document.querySelector('.planet-switcher .ps-name');
       return ((el && el.textContent) || '').trim();
     };
-    if (curPlanet().toLowerCase() !== fromPlanet.toLowerCase()) {
-      const swBtn = document.querySelector('button.planet-switcher-btn');
-      if (!swBtn) throw new Error('planet switcher not found — is the game tab fully loaded?');
-      _pfPress(swBtn);
-      await _pfWait(() => document.querySelector('.planet-switcher-dropdown'), 4000, 'planet switcher');
-      const items = [...document.querySelectorAll('.planet-switcher-dropdown .ps-item')];
-      const pi = usPickPlanetItem(items.map(it => {
-        const nm = it.querySelector('.ps-item-name'), sy = it.querySelector('.ps-item-system');
-        return { name: (nm && nm.textContent) || '', system: (sy && sy.textContent) || '' };
-      }), fromPlanet, fromSystem);
-      if (pi < 0) throw new Error('launch planet "' + fromPlanet + '" is not in the planet switcher');
-      items[pi].click();
-      await _pfWait(() => curPlanet().toLowerCase() === fromPlanet.toLowerCase()
-        || !document.querySelector('.planet-switcher-dropdown'), 5000, 'active-planet switch');
-      await new Promise(r => setTimeout(r, 300));
-    }
-    // 2. The galaxy page — SPA-navigate; a full page load would destroy the
-    // JS context running this very RPC.
+    if (curPlanet().toLowerCase() === fromPlanet.toLowerCase()) return;
+    const swBtn = document.querySelector('button.planet-switcher-btn');
+    if (!swBtn) throw new Error('planet switcher not found — is the game tab fully loaded?');
+    _pfPress(swBtn);
+    await _pfWait(() => document.querySelector('.planet-switcher-dropdown'), 4000, 'planet switcher');
+    const items = [...document.querySelectorAll('.planet-switcher-dropdown .ps-item')];
+    const pi = usPickPlanetItem(items.map(it => {
+      const nm = it.querySelector('.ps-item-name'), sy = it.querySelector('.ps-item-system');
+      return { name: (nm && nm.textContent) || '', system: (sy && sy.textContent) || '' };
+    }), fromPlanet, fromSystem);
+    if (pi < 0) throw new Error('launch planet "' + fromPlanet + '" is not in the planet switcher');
+    items[pi].click();
+    await _pfWait(() => curPlanet().toLowerCase() === fromPlanet.toLowerCase()
+      || !document.querySelector('.planet-switcher-dropdown'), 5000, 'active-planet switch');
+    await new Promise(r => setTimeout(r, 300));
+  }
+  // Open the target system's galaxy panel: SPA-navigate (a full page load
+  // would destroy the JS context running the RPC), type the name, click the
+  // EXACT-match result row (results include planets like "G24-13-P1" —
+  // prefix matches are wrong).
+  async function _pfOpenSystemPanel(systemName) {
     if (!document.querySelector('.galaxy-search-input')) {
       const nav = document.querySelector('a.sidebar-link[href^="/galaxy"]');
       if (!nav) throw new Error('galaxy sidebar link not found');
       nav.click();
       await _pfWait(() => document.querySelector('.galaxy-search-input'), 8000, 'galaxy page');
     }
-    // 3. Find the system: type its name, click the EXACT-match result row
-    // (results include planets like "G24-13-P1" — prefix matches are wrong).
     _pfSetInput(document.querySelector('.galaxy-search-input'), systemName);
     await _pfWait(() => document.querySelector('.galaxy-search-result'), 5000, 'search results');
     const rows = [...document.querySelectorAll('.galaxy-search-result')];
@@ -1195,16 +1227,116 @@
     if (ri < 0) throw new Error('system "' + systemName + '" not found in the galaxy search');
     rows[ri].click();
     await _pfWait(() => document.querySelector('.panel-survey-section'), 6000, 'system panel');
-    // 4. STOP. Report readiness; the user clicks "Survey System" themselves.
+  }
+  async function prefillSurvey(req) {
+    const b = req || {};
+    const systemName = String(b.systemName || '').trim();
+    const fromPlanet = String(b.fromPlanet || '').trim();
+    if (!systemName || !fromPlanet) return Promise.reject(new Error('bad prefill request'));
+    await _pfSetActivePlanet(fromPlanet, String(b.fromSystem || '').trim());
+    await _pfOpenSystemPanel(systemName);
+    // STOP. Report readiness; the user clicks "Survey System" themselves.
     const ind = document.querySelector('.survey-status-indicator');
     return { ready: !ind, status: ind ? ind.textContent.trim() : null };
+  }
+  // ── Dispatch_2: prefill pirate-camp attack / wormhole run / field mine (v1.22) ──
+  // All three end in the SAME .spy-modal (Send From + ship steppers) and stop
+  // short of the confirm. Pirates and wormholes are fleet-page cards; mine
+  // lives on the galaxy panel's field cards (matched by the printed field id).
+  async function prefillPirates(req) {
+    const b = req || {};
+    const systemName = String(b.systemName || '').trim();
+    const fromPlanet = String(b.fromPlanet || '').trim();
+    if (!systemName || !fromPlanet) throw new Error('bad prefill request');
+    // Camp cards: the ATTACK button is the danger-styled one (locale-proof);
+    // several camps can share a system — the first attackable card is staged.
+    const modal = await _pfOpenCardModal({
+      tabLabels: PIRATES_TAB_LABELS, tabName: 'Pirates', paneSel: '.pirates-tab',
+      cardSel: '.pirates-tab .pirate-camp-card', locSel: '.pirate-camp-info span',
+      btnSel: 'button.btn-danger', systemName,
+      noCardMsg: 'no attackable pirate camp for ' + systemName +
+        ' in the game’s list — it may have been cleared',
+    });
+    await _pfSelectSource(modal, fromPlanet);
+    return _pfFillFleet(modal, b.fleet || {}, fromPlanet);
+  }
+  async function prefillWormhole(req) {
+    const b = req || {};
+    const systemName = String(b.systemName || '').trim();
+    const fromPlanet = String(b.fromPlanet || '').trim();
+    if (!systemName || !fromPlanet) throw new Error('bad prefill request');
+    if (!document.querySelector('.fleet-page')) {
+      const nav = document.querySelector('a.sidebar-link[href="/fleet"]');
+      if (!nav) throw new Error('game sidebar not found — is the game tab fully loaded?');
+      nav.click();
+      await _pfWait(() => document.querySelector('.fleet-page'), 8000, 'fleet page');
+    }
+    const tabs = [...document.querySelectorAll('button.fleet-tab')];
+    const ti = usPickFleetTab(tabs.map(t => t.textContent || ''), WORMHOLES_TAB_LABELS);
+    if (ti < 0) throw new Error('Wormholes tab not found on the fleet page');
+    tabs[ti].click();
+    await _pfWait(() => document.querySelector('.wormhole-card, .wormhole-btn'), 6000, 'wormhole list');
+    const cards = [...document.querySelectorAll('.wormhole-card')];
+    const wi = usPickWormholeCard(cards.map(c => {
+      const nm = c.querySelector('.wormhole-name'), cl = c.querySelector('.wormhole-class');
+      const sys = c.querySelector('.wormhole-info span');
+      return { name: (nm && nm.textContent) || '', cls: (cl && cl.textContent) || '',
+               system: (sys && sys.textContent) || '',
+               hasAction: !!c.querySelector('.wormhole-btn.dispatch') };
+    }), b.wormholeId, systemName, b.wormholeClass);
+    if (wi < 0) throw new Error('no enterable wormhole for ' + systemName +
+      ' in the game’s list — it may have collapsed');
+    cards[wi].querySelector('.wormhole-btn.dispatch').click();
+    const modal = await _pfWait(() => document.querySelector('.spy-modal'), 6000, 'wormhole modal');
+    await _pfSelectSource(modal, fromPlanet);
+    return _pfFillFleet(modal, b.fleet || {}, fromPlanet);
+  }
+  async function prefillMine(req) {
+    const b = req || {};
+    const systemName = String(b.systemName || '').trim();
+    const fromPlanet = String(b.fromPlanet || '').trim();
+    if (!systemName || !fromPlanet || b.fieldId == null) throw new Error('bad prefill request');
+    // The galaxy panel's mine button gates on the ACTIVE planet's mining
+    // ships (observed live: "No mining ship" with a minerless planet focused)
+    // even though the modal has its own Send From — so focus the launch
+    // planet first, like survey does.
+    await _pfSetActivePlanet(fromPlanet, String(b.fromSystem || '').trim());
+    await _pfOpenSystemPanel(systemName);
+    // Field cards live in a collapsible panel section — expand any section
+    // that has no rendered body yet, then match the card by its printed id.
+    if (!document.querySelector('.field-card')) {
+      [...document.querySelectorAll('.panel-section')].forEach(sec => {
+        if (!sec.querySelector('.panel-section-body')) {
+          const t = sec.querySelector('.panel-section-toggle');
+          if (t) t.click();
+        }
+      });
+      await new Promise(r => setTimeout(r, 500));
+    }
+    const cards = [...document.querySelectorAll('.field-card')];
+    const fi = usPickFieldCard(cards.map(c => {
+      const id = c.querySelector('.field-id-copy');
+      return { idText: (id && id.textContent) || '',
+               hasAction: !!c.querySelector('.mine-btn') };
+    }), b.fieldId);
+    if (fi < 0) throw new Error('field #' + b.fieldId + ' not on the ' + systemName +
+      ' panel — the survey data may be stale');
+    const mineBtn = cards[fi].querySelector('.mine-btn');
+    if (mineBtn.disabled) throw new Error('the game refuses to mine this field from ' +
+      fromPlanet + ': ' + (mineBtn.textContent || '').trim());
+    mineBtn.click();
+    const modal = await _pfWait(() => document.querySelector('.spy-modal'), 6000, 'mining modal');
+    await _pfSelectSource(modal, fromPlanet);
+    return _pfFillFleet(modal, b.fleet || {}, fromPlanet);
   }
 
   const RPC = { 'fuel-estimate': fuelEstimate, 'launch-mission': launchMission, 'recall-mission': recallMission,
                 'planet-info': planetInfo, 'explore-scan': exploreScan, 'explore-dispatch': exploreDispatch,
                 'build-upgrade': buildUpgrade, 'build-cancel': buildCancel, 'shipyard-info': shipyardInfo,
                 'ship-build': shipBuild, 'ship-cancel': shipCancel, 'prefill-investigate': prefillInvestigate,
-                'prefill-survey': prefillSurvey, 'prefill-salvage': prefillSalvage };
+                'prefill-survey': prefillSurvey, 'prefill-salvage': prefillSalvage,
+                'prefill-pirates': prefillPirates, 'prefill-wormhole': prefillWormhole,
+                'prefill-mine': prefillMine };
 
   const _winHandled = new Map();   // window-path request id -> reply (dedup, F40)
   window.addEventListener('message', async (ev) => {
