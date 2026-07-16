@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         NexStar Fleet Reporter
 // @namespace    https://nexusnavigators.us/
-// @version      1.18.1
+// @version      1.19.0
 // @description  Reports your Nexus Legacy fleet positions to the NexStar map, and answers the map's fuel-estimate and own-planet logistics requests. Your session token never leaves your browser. SECURITY: hosted from a public branch-protected GitHub repo, no silent auto-update; the map can only run self-owned actions (transfers, colony builds) without an in-game confirm.
 // @match        https://s0.nexuslegacy.space/*
 // @match        https://nexstar.nexusnavigators.us/*
@@ -231,6 +231,72 @@
     const ok = action === 'upgrade' ? /^\/api\/buildings\/planets\/\d+\/buildings\/\d+\/upgrade$/
              : action === 'cancel'  ? /^\/api\/buildings\/planets\/\d+\/buildings\/\d+\/cancel$/ : null;
     return (ok && ok.test(ep)) ? ep : null;
+  }
+
+  // ── Dispatch_2 prefill (v1.19) — pure matching decisions ──────────────────
+  // The DOM driver (prefillInvestigate, below the sentinels) walks the game's
+  // OWN Investigate form; these helpers decide WHAT to click/type from plain
+  // descriptors so every decision executes in tests. The game UI is localized:
+  // the Surveys tab is matched against every label the app bundle ships
+  // (extracted 2026-07-16); everything else anchors on locale-independent
+  // tokens (system name, ship-icon filename, planet-name prefix). Selector
+  // contract: docs/game-actions/investigate-dom-map.md (map repo).
+  const SURVEYS_TAB_LABELS = ['Surveys', 'Sondages', 'Sondeos', 'Vermessung',
+    'Ricognizioni', 'Сканирование', 'Сканирания', 'Огляди', 'Skanowanie',
+    'Průzkumy', 'Prieskum', 'Cercetări', 'Istraživanja', 'Pregledi',
+    'Kartoitukset', 'Onderzoeken', 'Reconhecimentos', 'Varreduras', 'Taramalar',
+    'Undersøgelser', 'Undersøkelser', 'Undersökningar', 'Vizsgálatok',
+    'Έρευνες', '勘测'];
+  // → index of the Surveys tab among the fleet-tab label strings, or -1.
+  function usPickSurveysTab(labels) {
+    return (labels || []).findIndex(t => SURVEYS_TAB_LABELS.some(l => String(t || '').includes(l)));
+  }
+  // → index of the survey card whose location token names this system, or -1.
+  // Cards: [{location: "Z45-3 · Dead Space", hasInvestigate}]; the token ahead
+  // of '·' is the system name. Cards without an Investigate button (expired,
+  // already en route, plain combat reports) never match.
+  function usPickSurveyCard(cards, systemName) {
+    const want = String(systemName || '').trim().toLowerCase();
+    if (!want) return -1;
+    return (cards || []).findIndex(c => c && c.hasInvestigate
+      && String(c.location || '').split('·')[0].trim().toLowerCase() === want);
+  }
+  // → index of the Send-From option for this planet, or -1. Options read
+  // "PlanetName - 401 ly" / "Walla Walla (Home) - 710 ly" / "Colony X - 9 ly";
+  // the distance varies per target, so strip it and match the name by
+  // exactness first, then the game's known decorations.
+  function usPickSourceOption(labels, planetName) {
+    const want = String(planetName || '').trim().toLowerCase();
+    if (!want) return -1;
+    const bare = (labels || []).map(t =>
+      String(t || '').replace(/\s*-\s*[\d.,]+\s*ly\s*$/i, '').trim().toLowerCase());
+    let i = bare.findIndex(b => b === want);
+    if (i < 0) i = bare.findIndex(b => b.replace(/^colony\s+/, '') === want);
+    if (i < 0) i = bare.findIndex(b => b.indexOf(want + ' (') === 0);   // "(Home)" etc.
+    if (i < 0) i = bare.findIndex(b => b.indexOf(want) !== -1);
+    return i;
+  }
+  // Fleet-fill plan: rows [{icon: ".../missile_cruiser.webp?v=…", max}] from the
+  // form + the planned fleet {shipKey: qty} → {plan: [{index, qty}], missing,
+  // short}. Rows are matched by ICON FILENAME — it carries the exact game ship
+  // key (verified live 2026-07-16) — never by the localized display name.
+  // Quantities clamp to the row's max (the form's own availability).
+  function usPlanFleetFill(rows, fleet) {
+    const plan = [], missing = [], short = [];
+    const iconKey = s => String(s || '').split('/').pop().split('?')[0].replace(/\.\w+$/, '');
+    const idx = {};
+    (rows || []).forEach((r, i) => { const k = iconKey(r && r.icon); if (k && !(k in idx)) idx[k] = i; });
+    for (const k in (fleet || {})) {
+      const want = Math.floor(+fleet[k] || 0);
+      if (want <= 0) continue;
+      if (!(k in idx)) { missing.push(k); continue; }
+      const i = idx[k];
+      const max = Math.max(0, Math.floor(+((rows[i] || {}).max) || 0));
+      const qty = Math.min(want, max);
+      if (qty < want) short.push(k + ' ' + qty + '/' + want);
+      if (qty > 0) plan.push({ index: i, qty });
+    }
+    return { plan, missing, short };
   }
   // ==US-ENGINE-END==
 
@@ -910,10 +976,108 @@
     return gamePost(endpoint, null);   // BODYLESS — content-length 0, like the game UI
   }
 
+  // ── Dispatch_2: prefill the game's OWN Investigate form (v1.19) ────────────
+  // Walks the live UI (fleet page → Surveys tab → the anomaly's card → modal),
+  // selects the source planet and types the ship counts, then STOPS — the user
+  // reviews and clicks the game's own confirm. This RPC never presses the
+  // confirm button and never calls a game API, so it stays in the safe tier.
+  // Selector contract + proven techniques (native value setter for React
+  // inputs, async menu mount): docs/game-actions/investigate-dom-map.md.
+  function _pfWait(test, ms, step) {
+    return new Promise((resolve, reject) => {
+      const t0 = Date.now();
+      (function poll() {
+        let v = null;
+        try { v = test(); } catch (e) { /* keep polling */ }
+        if (v) return resolve(v);
+        if (Date.now() - t0 > ms) return reject(new Error('game UI never showed: ' + step));
+        setTimeout(poll, 150);
+      })();
+    });
+  }
+  // React ignores plain `.value =` writes — go through the native setter and
+  // fire `input` so its onChange sees the change (proven live 2026-07-16).
+  function _pfSetInput(inp, val) {
+    const set = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value').set;
+    set.call(inp, String(val));
+    inp.dispatchEvent(new Event('input', { bubbles: true }));
+  }
+  // The location dropdown needs the full press sequence; its menu mounts async.
+  function _pfPress(el) {
+    el.dispatchEvent(new MouseEvent('mousedown', { bubbles: true }));
+    el.dispatchEvent(new MouseEvent('mouseup', { bubbles: true }));
+    el.click();
+  }
+  async function prefillInvestigate(req) {
+    const b = req || {};
+    const systemName = String(b.systemName || '').trim();
+    const fromPlanet = String(b.fromPlanet || '').trim();
+    const fleet = b.fleet || {};
+    if (!systemName || !fromPlanet) throw new Error('bad prefill request');
+    // 1. Fleet page — SPA-navigate via the game's own sidebar link.
+    if (!document.querySelector('.fleet-page')) {
+      const nav = document.querySelector('a.sidebar-link[href="/fleet"]');
+      if (!nav) throw new Error('game sidebar not found — is the game tab fully loaded?');
+      nav.click();
+      await _pfWait(() => document.querySelector('.fleet-page'), 8000, 'fleet page');
+    }
+    // 2. Surveys tab (label localized — matched against every shipped translation).
+    const tabs = [...document.querySelectorAll('button.fleet-tab')];
+    const ti = usPickSurveysTab(tabs.map(t => t.textContent || ''));
+    if (ti < 0) throw new Error('Surveys tab not found on the fleet page');
+    tabs[ti].click();
+    await _pfWait(() => document.querySelector('.surveys-tab'), 6000, 'survey reports');
+    // 3. This anomaly's card, by its system token.
+    const cards = [...document.querySelectorAll('.report-card.rep-survey')];
+    const ci = usPickSurveyCard(cards.map(c => {
+      const loc = c.querySelector('.rep-location');
+      return { location: (loc && (loc.getAttribute('title') || loc.textContent)) || '',
+               hasInvestigate: !!c.querySelector('.investigate-btn') };
+    }), systemName);
+    if (ci < 0) throw new Error('no investigable anomaly for ' + systemName +
+      ' in the game’s survey list — it may have expired or already be en route');
+    cards[ci].querySelector('.investigate-btn').click();
+    const modal = await _pfWait(() => document.querySelector('.spy-modal'), 6000, 'investigate modal');
+    // 4. Send From — skip when the game already preselected the right planet.
+    const curLabel = () => {
+      const el = modal.querySelector('.location-select-row-label');
+      return (el && el.textContent) || '';
+    };
+    const optsOf = () => [...document.querySelectorAll('.location-select-menu .location-select-option')];
+    if (usPickSourceOption([curLabel()], fromPlanet) !== 0) {
+      _pfPress(modal.querySelector('.location-select-button'));
+      await _pfWait(() => optsOf().length, 4000, 'source planet menu');
+      const opts = optsOf();
+      const oi = usPickSourceOption(opts.map(o => o.textContent || ''), fromPlanet);
+      if (oi < 0) throw new Error('source planet "' + fromPlanet + '" is not in the Send From list');
+      opts[oi].click();
+      await _pfWait(() => !optsOf().length, 4000, 'menu close');
+      await new Promise(r => setTimeout(r, 350));   // rows re-render with the new source's availability
+    }
+    // 5. Ship counts — rows matched by icon filename (= game ship key), clamped
+    // to the form's own max. The confirm button is NEVER touched.
+    const rowEls = [...modal.querySelectorAll('.ship-select-row')];
+    const descs = rowEls.map(r => {
+      const img = r.querySelector('.ship-select-name img');
+      const inp = r.querySelector('input[type="number"]');
+      return { icon: (img && img.getAttribute('src')) || '',
+               max: (inp && inp.getAttribute('max')) || 0 };
+    });
+    const fill = usPlanFleetFill(descs, fleet);
+    if (!fill.plan.length) throw new Error('none of the planned ships are available at ' + fromPlanet);
+    let placed = 0;
+    for (const p of fill.plan) {
+      _pfSetInput(rowEls[p.index].querySelector('input[type="number"]'), p.qty);
+      placed += p.qty;
+      await new Promise(r => setTimeout(r, 60));   // let React commit between rows
+    }
+    return { placed, missing: fill.missing, short: fill.short };
+  }
+
   const RPC = { 'fuel-estimate': fuelEstimate, 'launch-mission': launchMission, 'recall-mission': recallMission,
                 'planet-info': planetInfo, 'explore-scan': exploreScan, 'explore-dispatch': exploreDispatch,
                 'build-upgrade': buildUpgrade, 'build-cancel': buildCancel, 'shipyard-info': shipyardInfo,
-                'ship-build': shipBuild, 'ship-cancel': shipCancel };
+                'ship-build': shipBuild, 'ship-cancel': shipCancel, 'prefill-investigate': prefillInvestigate };
 
   const _winHandled = new Map();   // window-path request id -> reply (dedup, F40)
   window.addEventListener('message', async (ev) => {
