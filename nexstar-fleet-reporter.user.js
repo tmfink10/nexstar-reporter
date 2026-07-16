@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         NexStar Fleet Reporter
 // @namespace    https://nexusnavigators.us/
-// @version      1.20.0
+// @version      1.21.0
 // @description  Reports your Nexus Legacy fleet positions to the NexStar map, and answers the map's fuel-estimate and own-planet logistics requests. Your session token never leaves your browser. SECURITY: hosted from a public branch-protected GitHub repo, no silent auto-update; the map can only run self-owned actions (transfers, colony builds) without an in-game confirm.
 // @match        https://s0.nexuslegacy.space/*
 // @match        https://nexstar.nexusnavigators.us/*
@@ -247,9 +247,18 @@
     'Kartoitukset', 'Onderzoeken', 'Reconhecimentos', 'Varreduras', 'Taramalar',
     'Undersøgelser', 'Undersøkelser', 'Undersökningar', 'Vizsgálatok',
     'Έρευνες', '勘测'];
+  const DEBRIS_TAB_LABELS = ['Debris', 'Débris', 'Destroços', 'Detriti',
+    'Enkaz', 'Escombros', 'Jäänteet', 'Krhotine', 'Puin', 'Razbitine',
+    'Resturi', 'Roncsok', 'Skräp', 'Szczątki', 'Trosky', 'Trümmer',
+    'Vraggods', 'Vrakrester', 'Συντρίμμια', 'Обломки', 'Отломки', 'Уламки',
+    '残骸'];
+  // → index of the tab whose (localized) label is in the set, or -1.
+  function usPickFleetTab(labels, tabSet) {
+    return (labels || []).findIndex(t => (tabSet || []).some(l => String(t || '').includes(l)));
+  }
   // → index of the Surveys tab among the fleet-tab label strings, or -1.
   function usPickSurveysTab(labels) {
-    return (labels || []).findIndex(t => SURVEYS_TAB_LABELS.some(l => String(t || '').includes(l)));
+    return usPickFleetTab(labels, SURVEYS_TAB_LABELS);
   }
   // → index of the survey card whose location token names this system, or -1.
   // Cards: [{location: "Z45-3 · Dead Space", hasInvestigate}]; the token ahead
@@ -1029,54 +1038,53 @@
     el.dispatchEvent(new MouseEvent('mouseup', { bubbles: true }));
     el.click();
   }
-  async function prefillInvestigate(req) {
-    const b = req || {};
-    const systemName = String(b.systemName || '').trim();
-    const fromPlanet = String(b.fromPlanet || '').trim();
-    const fleet = b.fleet || {};
-    if (!systemName || !fromPlanet) throw new Error('bad prefill request');
-    // 1. Fleet page — SPA-navigate via the game's own sidebar link.
+  // Shared staging steps — the game reuses ONE modal pattern (.spy-modal with
+  // a .location-select source + .ship-select-row steppers) across the fleet
+  // page's card actions: investigate (v1.19) and debris salvage (v1.21).
+  // Every step stops short of the confirm button.
+  // Fleet page → the given tab → the system's card → its action button → modal.
+  async function _pfOpenCardModal(o) {
     if (!document.querySelector('.fleet-page')) {
       const nav = document.querySelector('a.sidebar-link[href="/fleet"]');
       if (!nav) throw new Error('game sidebar not found — is the game tab fully loaded?');
       nav.click();
       await _pfWait(() => document.querySelector('.fleet-page'), 8000, 'fleet page');
     }
-    // 2. Surveys tab (label localized — matched against every shipped translation).
     const tabs = [...document.querySelectorAll('button.fleet-tab')];
-    const ti = usPickSurveysTab(tabs.map(t => t.textContent || ''));
-    if (ti < 0) throw new Error('Surveys tab not found on the fleet page');
+    const ti = usPickFleetTab(tabs.map(t => t.textContent || ''), o.tabLabels);
+    if (ti < 0) throw new Error(o.tabName + ' tab not found on the fleet page');
     tabs[ti].click();
-    await _pfWait(() => document.querySelector('.surveys-tab'), 6000, 'survey reports');
-    // 3. This anomaly's card, by its system token.
-    const cards = [...document.querySelectorAll('.report-card.rep-survey')];
+    await _pfWait(() => document.querySelector(o.paneSel), 6000, o.tabName + ' pane');
+    const cards = [...document.querySelectorAll(o.cardSel)];
     const ci = usPickSurveyCard(cards.map(c => {
-      const loc = c.querySelector('.rep-location');
+      const loc = c.querySelector(o.locSel);
       return { location: (loc && (loc.getAttribute('title') || loc.textContent)) || '',
-               hasInvestigate: !!c.querySelector('.investigate-btn') };
-    }), systemName);
-    if (ci < 0) throw new Error('no investigable anomaly for ' + systemName +
-      ' in the game’s survey list — it may have expired or already be en route');
-    cards[ci].querySelector('.investigate-btn').click();
-    const modal = await _pfWait(() => document.querySelector('.spy-modal'), 6000, 'investigate modal');
-    // 4. Send From — skip when the game already preselected the right planet.
+               hasInvestigate: !!c.querySelector(o.btnSel) };
+    }), o.systemName);
+    if (ci < 0) throw new Error(o.noCardMsg);
+    cards[ci].querySelector(o.btnSel).click();
+    return _pfWait(() => document.querySelector('.spy-modal'), 6000, o.tabName + ' modal');
+  }
+  // Send From — skip when the game already preselected the right planet.
+  async function _pfSelectSource(modal, fromPlanet) {
     const curLabel = () => {
       const el = modal.querySelector('.location-select-row-label');
       return (el && el.textContent) || '';
     };
     const optsOf = () => [...document.querySelectorAll('.location-select-menu .location-select-option')];
-    if (usPickSourceOption([curLabel()], fromPlanet) !== 0) {
-      _pfPress(modal.querySelector('.location-select-button'));
-      await _pfWait(() => optsOf().length, 4000, 'source planet menu');
-      const opts = optsOf();
-      const oi = usPickSourceOption(opts.map(o => o.textContent || ''), fromPlanet);
-      if (oi < 0) throw new Error('source planet "' + fromPlanet + '" is not in the Send From list');
-      opts[oi].click();
-      await _pfWait(() => !optsOf().length, 4000, 'menu close');
-      await new Promise(r => setTimeout(r, 350));   // rows re-render with the new source's availability
-    }
-    // 5. Ship counts — rows matched by icon filename (= game ship key), clamped
-    // to the form's own max. The confirm button is NEVER touched.
+    if (usPickSourceOption([curLabel()], fromPlanet) === 0) return;
+    _pfPress(modal.querySelector('.location-select-button'));
+    await _pfWait(() => optsOf().length, 4000, 'source planet menu');
+    const opts = optsOf();
+    const oi = usPickSourceOption(opts.map(o => o.textContent || ''), fromPlanet);
+    if (oi < 0) throw new Error('source planet "' + fromPlanet + '" is not in the Send From list');
+    opts[oi].click();
+    await _pfWait(() => !optsOf().length, 4000, 'menu close');
+    await new Promise(r => setTimeout(r, 350));   // rows re-render with the new source's availability
+  }
+  // Ship counts — rows matched by icon filename (= game ship key), clamped to
+  // the form's own max. The confirm button is NEVER touched.
+  async function _pfFillFleet(modal, fleet, fromPlanet) {
     const rowEls = [...modal.querySelectorAll('.ship-select-row')];
     const descs = rowEls.map(r => {
       const img = r.querySelector('.ship-select-name img');
@@ -1093,6 +1101,43 @@
       await new Promise(r => setTimeout(r, 60));   // let React commit between rows
     }
     return { placed, missing: fill.missing, short: fill.short };
+  }
+  async function prefillInvestigate(req) {
+    const b = req || {};
+    const systemName = String(b.systemName || '').trim();
+    const fromPlanet = String(b.fromPlanet || '').trim();
+    if (!systemName || !fromPlanet) throw new Error('bad prefill request');
+    const modal = await _pfOpenCardModal({
+      tabLabels: SURVEYS_TAB_LABELS, tabName: 'Surveys', paneSel: '.surveys-tab',
+      cardSel: '.report-card.rep-survey', locSel: '.rep-location', btnSel: '.investigate-btn',
+      systemName,
+      noCardMsg: 'no investigable anomaly for ' + systemName +
+        ' in the game’s survey list — it may have expired or already be en route',
+    });
+    await _pfSelectSource(modal, fromPlanet);
+    return _pfFillFleet(modal, b.fleet || {}, fromPlanet);
+  }
+  // ── Dispatch_2: prefill the debris-salvage form (v1.21) ─────────────────────
+  // Fleet → Debris tab → the system's debris card → "collect" modal (same
+  // .spy-modal pattern as investigate: Send From + cargo-ship steppers; the
+  // form itself offers only cargo-capable ships). Fill and STOP — the user
+  // clicks the game's "Send N ships". If a system holds several debris fields,
+  // the first card with a collect button is staged (the user can retarget in
+  // the open form). No game API is called.
+  async function prefillSalvage(req) {
+    const b = req || {};
+    const systemName = String(b.systemName || '').trim();
+    const fromPlanet = String(b.fromPlanet || '').trim();
+    if (!systemName || !fromPlanet) throw new Error('bad prefill request');
+    const modal = await _pfOpenCardModal({
+      tabLabels: DEBRIS_TAB_LABELS, tabName: 'Debris', paneSel: '.debris-tab',
+      cardSel: '.debris-tab .expedition-mission-card', locSel: '.debris-system-link',
+      btnSel: '.collect-salvage-btn', systemName,
+      noCardMsg: 'no collectable debris for ' + systemName +
+        ' in the game’s debris list — it may have expired or been collected',
+    });
+    await _pfSelectSource(modal, fromPlanet);
+    return _pfFillFleet(modal, b.fleet || {}, fromPlanet);
   }
 
   // ── Dispatch_2: stage a SURVEY in the game UI (v1.20) ───────────────────────
@@ -1159,7 +1204,7 @@
                 'planet-info': planetInfo, 'explore-scan': exploreScan, 'explore-dispatch': exploreDispatch,
                 'build-upgrade': buildUpgrade, 'build-cancel': buildCancel, 'shipyard-info': shipyardInfo,
                 'ship-build': shipBuild, 'ship-cancel': shipCancel, 'prefill-investigate': prefillInvestigate,
-                'prefill-survey': prefillSurvey };
+                'prefill-survey': prefillSurvey, 'prefill-salvage': prefillSalvage };
 
   const _winHandled = new Map();   // window-path request id -> reply (dedup, F40)
   window.addEventListener('message', async (ev) => {
