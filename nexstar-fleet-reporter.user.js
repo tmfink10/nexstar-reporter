@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         NexStar Fleet Reporter
 // @namespace    https://nexusnavigators.us/
-// @version      1.19.0
+// @version      1.20.0
 // @description  Reports your Nexus Legacy fleet positions to the NexStar map, and answers the map's fuel-estimate and own-planet logistics requests. Your session token never leaves your browser. SECURITY: hosted from a public branch-protected GitHub repo, no silent auto-update; the map can only run self-owned actions (transfers, colony builds) without an in-game confirm.
 // @match        https://s0.nexuslegacy.space/*
 // @match        https://nexstar.nexusnavigators.us/*
@@ -297,6 +297,27 @@
       if (qty > 0) plan.push({ index: i, qty });
     }
     return { plan, missing, short };
+  }
+  // → index of the planet-switcher item for the launch planet, or -1. Items:
+  // [{name: "The Unforgiven", system: "[G24-15]"}]. Name match first; a
+  // .ps-item-name can render empty mid-load, so fall back to the system token
+  // (fromSystem WITHOUT brackets). Two colonies can share a system — the name
+  // match always wins when present.
+  function usPickPlanetItem(items, planetName, fromSystem) {
+    const wantName = String(planetName || '').trim().toLowerCase();
+    const wantSys = String(fromSystem || '').trim().toLowerCase();
+    let i = wantName ? (items || []).findIndex(it =>
+      String((it && it.name) || '').trim().toLowerCase() === wantName) : -1;
+    if (i < 0 && wantSys) i = (items || []).findIndex(it =>
+      String((it && it.system) || '').replace(/[[\]]/g, '').trim().toLowerCase() === wantSys);
+    return i;
+  }
+  // → index of the galaxy search result whose name IS the system, or -1.
+  // Results include planets ("G24-13-P1") — exact match only, never prefix.
+  function usPickSearchResult(names, systemName) {
+    const want = String(systemName || '').trim().toLowerCase();
+    if (!want) return -1;
+    return (names || []).findIndex(n => String(n || '').trim().toLowerCase() === want);
   }
   // ==US-ENGINE-END==
 
@@ -1074,10 +1095,71 @@
     return { placed, missing: fill.missing, short: fill.short };
   }
 
+  // ── Dispatch_2: stage a SURVEY in the game UI (v1.20) ───────────────────────
+  // Survey has no form at all: the galaxy panel's "Survey System" button
+  // launches a real fleet from the game's ACTIVE PLANET on the FIRST CLICK —
+  // no modal, no confirm (verified live 2026-07-16, the hard way). So this RPC
+  // does everything UP TO that click: set the active planet to the job's
+  // launch planet (the survey departs from whatever planet is focused), open
+  // the target system's galaxy panel, and STOP. It must NEVER click
+  // button.survey-btn. Selector contract: docs/game-actions/investigate-dom-map.md.
+  async function prefillSurvey(req) {
+    const b = req || {};
+    const systemName = String(b.systemName || '').trim();
+    const fromPlanet = String(b.fromPlanet || '').trim();
+    const fromSystem = String(b.fromSystem || '').trim();
+    if (!systemName || !fromPlanet) return Promise.reject(new Error('bad prefill request'));
+    // 1. Active planet — the survey's launch source (no in-form selector exists).
+    const curPlanet = () => {
+      const el = document.querySelector('.planet-switcher .ps-name');
+      return ((el && el.textContent) || '').trim();
+    };
+    if (curPlanet().toLowerCase() !== fromPlanet.toLowerCase()) {
+      const swBtn = document.querySelector('button.planet-switcher-btn');
+      if (!swBtn) throw new Error('planet switcher not found — is the game tab fully loaded?');
+      _pfPress(swBtn);
+      await _pfWait(() => document.querySelector('.planet-switcher-dropdown'), 4000, 'planet switcher');
+      const items = [...document.querySelectorAll('.planet-switcher-dropdown .ps-item')];
+      const pi = usPickPlanetItem(items.map(it => {
+        const nm = it.querySelector('.ps-item-name'), sy = it.querySelector('.ps-item-system');
+        return { name: (nm && nm.textContent) || '', system: (sy && sy.textContent) || '' };
+      }), fromPlanet, fromSystem);
+      if (pi < 0) throw new Error('launch planet "' + fromPlanet + '" is not in the planet switcher');
+      items[pi].click();
+      await _pfWait(() => curPlanet().toLowerCase() === fromPlanet.toLowerCase()
+        || !document.querySelector('.planet-switcher-dropdown'), 5000, 'active-planet switch');
+      await new Promise(r => setTimeout(r, 300));
+    }
+    // 2. The galaxy page — SPA-navigate; a full page load would destroy the
+    // JS context running this very RPC.
+    if (!document.querySelector('.galaxy-search-input')) {
+      const nav = document.querySelector('a.sidebar-link[href^="/galaxy"]');
+      if (!nav) throw new Error('galaxy sidebar link not found');
+      nav.click();
+      await _pfWait(() => document.querySelector('.galaxy-search-input'), 8000, 'galaxy page');
+    }
+    // 3. Find the system: type its name, click the EXACT-match result row
+    // (results include planets like "G24-13-P1" — prefix matches are wrong).
+    _pfSetInput(document.querySelector('.galaxy-search-input'), systemName);
+    await _pfWait(() => document.querySelector('.galaxy-search-result'), 5000, 'search results');
+    const rows = [...document.querySelectorAll('.galaxy-search-result')];
+    const ri = usPickSearchResult(rows.map(r => {
+      const n = r.querySelector('.search-result-name');
+      return (n && n.textContent) || '';
+    }), systemName);
+    if (ri < 0) throw new Error('system "' + systemName + '" not found in the galaxy search');
+    rows[ri].click();
+    await _pfWait(() => document.querySelector('.panel-survey-section'), 6000, 'system panel');
+    // 4. STOP. Report readiness; the user clicks "Survey System" themselves.
+    const ind = document.querySelector('.survey-status-indicator');
+    return { ready: !ind, status: ind ? ind.textContent.trim() : null };
+  }
+
   const RPC = { 'fuel-estimate': fuelEstimate, 'launch-mission': launchMission, 'recall-mission': recallMission,
                 'planet-info': planetInfo, 'explore-scan': exploreScan, 'explore-dispatch': exploreDispatch,
                 'build-upgrade': buildUpgrade, 'build-cancel': buildCancel, 'shipyard-info': shipyardInfo,
-                'ship-build': shipBuild, 'ship-cancel': shipCancel, 'prefill-investigate': prefillInvestigate };
+                'ship-build': shipBuild, 'ship-cancel': shipCancel, 'prefill-investigate': prefillInvestigate,
+                'prefill-survey': prefillSurvey };
 
   const _winHandled = new Map();   // window-path request id -> reply (dedup, F40)
   window.addEventListener('message', async (ev) => {
