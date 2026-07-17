@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         NexStar Fleet Reporter
 // @namespace    https://nexusnavigators.us/
-// @version      1.23.0
+// @version      1.24.0
 // @description  Reports your Nexus Legacy fleet positions to the NexStar map, and answers the map's fuel-estimate and own-planet logistics requests. Your session token never leaves your browser. SECURITY: hosted from a public branch-protected GitHub repo, no silent auto-update; the map can only run self-owned actions (transfers, colony builds) without an in-game confirm.
 // @match        https://s0.nexuslegacy.space/*
 // @match        https://nexstar.nexusnavigators.us/*
@@ -195,6 +195,9 @@
       isConstructing: !!o.isConstructing,
       constructionEndsAt: o.constructionEndsAt || null,
       pendingBuildingKey: o.pendingBuildingKey || null,
+      // v1.24: detached/mid-move booleans (the map badges adrift outposts red
+      // and hides their stale belt card). Flags only — never ids/timestamps.
+      drifting: !!o.isDrifting, relocating: !!o.isRelocating,
       buildings: (o.buildings || []).map(b => ({ key: b && (b.buildingKey || b.key), level: (b && b.level) || 0 })),
       field: { id: f.id, name: f.name, fieldType: f.fieldType, richness: f.richness,
                totalResources: f.totalResources, remainingResources: f.remainingResources },
@@ -362,6 +365,17 @@
     if (want === '#') return -1;
     return (cards || []).findIndex(c => c && c.hasAction
       && String(c.idText || '').trim() === want);
+  }
+  // Pick the Outposts tab from the /mining tab strip descriptors
+  // ([{iconPath}] in DOM order). Icon fingerprint first (locale-proof; the
+  // outposts tab's svg path starts 'M12 16h' — captured live 2026-07-17),
+  // position fallback (the strip is [Missions, Outposts]). -1 = not found.
+  function pickMiningOutpostsTab(tabs) {
+    if (!tabs || !tabs.length) return -1;
+    for (let i = 0; i < tabs.length; i++) {
+      if (/^M12 16h/.test((tabs[i] && tabs[i].iconPath) || '')) return i;
+    }
+    return tabs.length > 1 ? 1 : -1;
   }
   // ==US-ENGINE-END==
 
@@ -1336,16 +1350,35 @@
   // area focuses that planet in the game (the pages operate on the ACTIVE
   // planet) and opens the matching sidebar menu. Pure navigation — nothing is
   // built, queued, or cancelled, so it stays in the safe tier.
-  const OPEN_MENU_OK = { buildings: 1, shipyard: 1, research: 1, overview: 1 };
+  const OPEN_MENU_OK = { buildings: 1, shipyard: 1, research: 1, overview: 1, mining: 1 };
   async function openMenu(req) {
     const b = req || {};
     const menu = String(b.menu || '');
     const fromPlanet = String(b.fromPlanet || '').trim();
-    if (!OPEN_MENU_OK[menu] || !fromPlanet) throw new Error('bad open-menu request');
-    await _pfSetActivePlanet(fromPlanet, String(b.fromSystem || '').trim());
+    // /mining is the account-wide outposts console — no active-planet focus;
+    // every other menu operates on the ACTIVE planet and requires one.
+    if (!OPEN_MENU_OK[menu] || (menu !== 'mining' && !fromPlanet)) throw new Error('bad open-menu request');
+    if (menu !== 'mining') await _pfSetActivePlanet(fromPlanet, String(b.fromSystem || '').trim());
     const nav = document.querySelector('a.sidebar-link[href="/' + menu + '"]');
     if (!nav) throw new Error('game menu link not found: ' + menu);
     nav.click();
+    if (menu === 'mining' && String(b.tab || '') === 'outposts') {
+      // v1.24: land on the OUTPOSTS tab. The game has no URL tab routing
+      // (verified live 2026-07-17) and the SPA strip mounts async; the tab is
+      // picked by icon fingerprint/position (labels are localized). Not
+      // finding it soft-degrades to plain /mining — never an error.
+      const strip = await _pfWait(() => {
+        const tabs = document.querySelectorAll('button.mining-tab');
+        return tabs.length ? [...tabs] : null;
+      }, 5000, 250).catch(() => null);
+      if (!strip) return { ok: true, status: 'Outposts tab not found — /mining opened' };
+      const idx = pickMiningOutpostsTab(strip.map(t => {
+        const p = t.querySelector('svg path');
+        return { iconPath: (p && p.getAttribute('d')) || '' };
+      }));
+      if (idx < 0) return { ok: true, status: 'Outposts tab not identified — /mining opened' };
+      _pfPress(strip[idx]);
+    }
     return { ok: true };
   }
 
