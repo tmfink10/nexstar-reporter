@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         NexStar Fleet Reporter
 // @namespace    https://nexusnavigators.us/
-// @version      1.25.0
+// @version      1.26.0
 // @description  Reports your Nexus Legacy fleet positions to the NexStar map, and answers the map's fuel-estimate and own-planet logistics requests. Your session token never leaves your browser. SECURITY: hosted from a public branch-protected GitHub repo, no silent auto-update; the map can only run self-owned actions (transfers, colony builds) without an in-game confirm.
 // @match        https://s0.nexuslegacy.space/*
 // @match        https://nexstar.nexusnavigators.us/*
@@ -171,6 +171,35 @@
     const maxQueueSize = (d && +d.maxQueueSize) || 0;
     const any = planetaryQueue || orbitalQueue || planetaryQueueAll.length || orbitalQueueAll.length;
     return any ? { planetaryQueue, orbitalQueue, planetaryQueueAll, orbitalQueueAll, maxQueueSize } : null;
+  }
+
+  // Moon colony info (/api/moons/{id}, v1.26): the console shows resources +
+  // structures + energy. The moon part's flat resource columns are forwarded
+  // (the server adapts its SINGLE basic `storage` cap — planets carry
+  // per-basic {key}Storage); buildings trim to dynamic fields + key/name
+  // (moon rows are flat — no .definition). Scan timestamps, defs, parent
+  // resources, and jump state never leave the browser.
+  const MOON_RES_KEYS = ['ore', 'silicates', 'hydrogen', 'alloys', 'cryoIce',
+                         'quantumDust', 'plasmaCore', 'bioExtract', 'darkMatter', 'antimatter'];
+  function slimMoonInfo(d) {
+    const m = d && d.moon;
+    if (!m || m.id == null) return null;
+    const moon = { id: m.id, planetId: m.planetId, systemId: m.systemId,
+                   name: m.name, moonType: m.moonType, size: m.size,
+                   buildingSlots: m.buildingSlots,
+                   storage: m.storage, rareResourceStorage: m.rareResourceStorage,
+                   energyProduced: m.energyProduced, energyConsumed: m.energyConsumed };
+    MOON_RES_KEYS.forEach(k => {
+      if (m[k] != null) moon[k] = m[k];
+      if (m[k + 'Rate'] != null) moon[k + 'Rate'] = m[k + 'Rate'];
+    });
+    const buildings = ((d && d.buildings) || [])
+      .filter(b => b && ((b.level || 0) > 0 || b.isUpgrading))
+      .map(b => ({ key: b.key, name: b.name, level: b.level || 0,
+                   isUpgrading: !!b.isUpgrading,
+                   upgradeEndsAt: b.upgradeEndsAt || null,
+                   upgradeStartedAt: b.upgradeStartedAt || b.upgradeStartsAt || null }));
+    return { moon, buildings };
   }
 
   // Own mining outposts: only the fields the map's Empire Console shows —
@@ -632,6 +661,26 @@
         outposts = ((op && op.outposts) || []).map(slimOutpost).filter(Boolean);
       } catch (e) { /* outposts optional */ }
 
+      // Moon colonies (v1.26): owned-moon ids ride the activity summary
+      // (me.planets carries NO moons; /api/moons has no list route), then each
+      // moon's info is fetched like a planet's. Both steps are optional —
+      // failures never kill the report cycle.
+      const moonInfos = {};
+      try {
+        await sleep(API_DELAY_MS);
+        const summary = await gget('/api/planets/activity-summary');
+        const moonIds = [];
+        (((summary && summary.planets) || [])).forEach(p =>
+          ((p && p.moons) || []).forEach(m => { if (m && m.id != null) moonIds.push(m.id); }));
+        for (const mid of moonIds) {
+          await sleep(API_DELAY_MS);
+          try {
+            const slim = slimMoonInfo(await gget('/api/moons/' + mid));
+            if (slim) moonInfos[mid] = slim;
+          } catch (e) { /* skip a moon we can't read */ }
+        }
+      } catch (e) { /* moons optional */ }
+
       // Building levels per colony (cached 5 min) + the static-definitions
       // catalog at most once per 24h — see planetInfos.
       const pi = await planetInfos(planets);
@@ -643,7 +692,7 @@
       const scriptVersion = (typeof GM_info !== 'undefined' && GM_info.script && GM_info.script.version) || null;
       const payload = { me: meSlim, planetFleets, planetInfos: pi.infos, missions, maxFleetSlots,
                         spyReports, research, researchActive, battleReports, outposts,
-                        shipyard: pi.shipyards, scriptVersion };
+                        moonInfos, shipyard: pi.shipyards, scriptVersion };
       if (pi.catalog) payload.buildingCatalog = pi.catalog;
       const res = await post(payload, key);
       if (res.ok) {
