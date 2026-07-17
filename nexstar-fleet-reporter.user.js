@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         NexStar Fleet Reporter
 // @namespace    https://nexusnavigators.us/
-// @version      1.24.0
+// @version      1.25.0
 // @description  Reports your Nexus Legacy fleet positions to the NexStar map, and answers the map's fuel-estimate and own-planet logistics requests. Your session token never leaves your browser. SECURITY: hosted from a public branch-protected GitHub repo, no silent auto-update; the map can only run self-owned actions (transfers, colony builds) without an in-game confirm.
 // @match        https://s0.nexuslegacy.space/*
 // @match        https://nexstar.nexusnavigators.us/*
@@ -376,6 +376,36 @@
       if (/^M12 16h/.test((tabs[i] && tabs[i].iconPath) || '')) return i;
     }
     return tabs.length > 1 ? 1 : -1;
+  }
+  // ── prefill-launch (v1.25) pure decisions ──────────────────────────────────
+  const DISPATCH_TAB_LABELS = ['Dispatch'];
+  // Viewer mission keys → the Dispatch form's <select> machine VALUES (option
+  // values captured live 2026-07-17: transfer/deliver/attack/raid/spy/gift/…).
+  // SECURITY: only the four self-logistics keys map — hostile mission types can
+  // never be staged through this RPC (null → bad request). The *_goods
+  // variants are the same game mission plus a cargo manifest.
+  function usDispatchMissionValue(k) {
+    const map = { transfer: 'transfer', transfer_goods: 'transfer',
+                  deliver: 'deliver', deliver_goods: 'deliver' };
+    return map[String(k || '')] || null;
+  }
+  // Cargo rows are matched by resource-icon filename (…/resources/ore.webp),
+  // locale-proof like the ship rows; keys normalize (case/underscores) so the
+  // viewer's quantum_dust meets the game's quantumDust/quantum_dust spellings.
+  function usCargoKeyFromIcon(src) {
+    const m = /\/([A-Za-z_\-]+)\.(webp|png|svg)/.exec(String(src || ''));
+    return m ? m[1].toLowerCase().replace(/[_\-]/g, '') : '';
+  }
+  function usPlanCargoFill(rows, cargo) {
+    const plan = [], missing = [];
+    for (const [key, qty] of Object.entries(cargo || {})) {
+      if (!(+qty > 0)) continue;
+      const norm = String(key).toLowerCase().replace(/[_\-]/g, '');
+      const idx = (rows || []).findIndex(r => usCargoKeyFromIcon(r && r.icon) === norm);
+      if (idx < 0) missing.push(key);
+      else plan.push({ index: idx, qty: Math.floor(+qty) });
+    }
+    return { plan, missing };
   }
   // ==US-ENGINE-END==
 
@@ -1151,6 +1181,94 @@
     }
     return { placed, missing: fill.missing, short: fill.short };
   }
+  // Native <select>s need the same native-setter treatment as inputs, but fire
+  // 'change' (React listens to change on selects).
+  function _pfSetSelect(sel, val) {
+    const set = Object.getOwnPropertyDescriptor(HTMLSelectElement.prototype, 'value').set;
+    set.call(sel, String(val));
+    sel.dispatchEvent(new Event('change', { bubbles: true }));
+  }
+  // Generalized location-select picker (the Dispatch tab has TWO — From and
+  // To — so the caller passes the trigger button). Name-prefix matched.
+  async function _pfSelectLocation(btn, wantName, what) {
+    const optsOf = () => [...document.querySelectorAll('.location-select-menu .location-select-option')];
+    if (usPickSourceOption([btn.textContent || ''], wantName) === 0) return;   // already selected
+    _pfPress(btn);
+    await _pfWait(() => optsOf().length, 4000, what + ' menu');
+    const opts = optsOf();
+    const oi = usPickSourceOption(opts.map(o => o.textContent || ''), wantName);
+    if (oi < 0) throw new Error(what + ' "' + wantName + '" is not in the list');
+    opts[oi].click();
+    await _pfWait(() => !optsOf().length, 4000, 'menu close');
+    await new Promise(r => setTimeout(r, 350));   // dependent sections re-render
+  }
+  // ── prefill-launch (v1.25): stage the Dispatch tab's send-fleet form ───────
+  // Selector contract: docs/game-actions/investigate-dom-map.md → "Dispatch
+  // (send fleet)". Mission set by machine value, From/To picked by name
+  // prefix, ships by icon-filename key, cargo by resource-icon key. THE
+  // "Dispatch Fleet" BUTTON IS NEVER TOUCHED — the user confirms in the game.
+  async function prefillLaunch(req) {
+    const b = req || {};
+    const mission = usDispatchMissionValue(b.missionType);
+    const fromPlanet = String(b.sourcePlanetName || '').trim();
+    const targetName = String(b.targetName || '').trim();
+    if (!mission || !fromPlanet || !targetName) throw new Error('bad prefill-launch request');
+    if (!document.querySelector('.fleet-page')) {
+      const nav = document.querySelector('a.sidebar-link[href="/fleet"]');
+      if (!nav) throw new Error('game sidebar not found — is the game tab fully loaded?');
+      nav.click();
+      await _pfWait(() => document.querySelector('.fleet-page'), 8000, 'fleet page');
+    }
+    const tabs = [...document.querySelectorAll('button.fleet-tab')];
+    const ti = usPickFleetTab(tabs.map(t => t.textContent || ''), DISPATCH_TAB_LABELS);
+    if (ti < 0) throw new Error('Dispatch tab not found on the fleet page');
+    tabs[ti].click();
+    const pane = await _pfWait(() => {
+      const p = document.querySelector('.fleet-page');
+      return p && p.querySelector('.dispatch-btn') && p.querySelector('select') ? p : null;
+    }, 6000, 'Dispatch form');
+    _pfSetSelect(pane.querySelector('select'), mission);
+    await new Promise(r => setTimeout(r, 300));   // cargo section mounts per mission type
+    const locBtns = [...pane.querySelectorAll('.location-select .location-select-button')];
+    if (locBtns.length < 2) throw new Error('From/To selectors not found on the Dispatch form');
+    await _pfSelectLocation(locBtns[0], fromPlanet, 'From planet');
+    await _pfSelectLocation(locBtns[1], targetName, 'To target');
+    // Ship rows (this pane's rows differ from the spy-modal's inner markup, so
+    // the icon is found generically inside the row).
+    const rowEls = [...pane.querySelectorAll('.ship-select-row')];
+    const fill = usPlanFleetFill(rowEls.map(r => {
+      const img = r.querySelector('img');
+      const inp = r.querySelector('input[type="number"]');
+      return { icon: (img && img.getAttribute('src')) || '',
+               max: (inp && inp.getAttribute('max')) || 0 };
+    }), b.fleet || {});
+    if (!fill.plan.length) throw new Error('none of the planned ships are available at ' + fromPlanet);
+    let placed = 0;
+    for (const p of fill.plan) {
+      _pfSetInput(rowEls[p.index].querySelector('input[type="number"]'), p.qty);
+      placed += p.qty;
+      await new Promise(r => setTimeout(r, 60));
+    }
+    // Cargo manifest (goods missions): match rows by resource icon.
+    let cargoMissing = [];
+    if (b.cargo && Object.keys(b.cargo).length) {
+      const cargoRows = [...pane.querySelectorAll('.gift-cargo-input-row')].map(el => {
+        const img = el.parentElement ? el.parentElement.querySelector('img') : null;
+        return { el, icon: (img && img.getAttribute('src')) || '' };
+      });
+      const cp = usPlanCargoFill(cargoRows.map(r => ({ icon: r.icon })), b.cargo);
+      cargoMissing = cp.missing;
+      for (const c of cp.plan) {
+        const inp = cargoRows[c.index].el.querySelector('input');
+        if (inp) { _pfSetInput(inp, c.qty); await new Promise(r => setTimeout(r, 60)); }
+      }
+    }
+    const notes = [];
+    if (fill.short && fill.short.length) notes.push('short: ' + fill.short.map(s => s.key + ' ' + s.got + '/' + s.want).join(', '));
+    if (fill.missing && fill.missing.length) notes.push('no row: ' + fill.missing.join(', '));
+    if (cargoMissing.length) notes.push('no cargo row: ' + cargoMissing.join(', '));
+    return { ok: true, placed, short: notes.length ? notes.join(' · ') : undefined };
+  }
   async function prefillInvestigate(req) {
     const b = req || {};
     const systemName = String(b.systemName || '').trim();
@@ -1388,7 +1506,8 @@
                 'ship-build': shipBuild, 'ship-cancel': shipCancel, 'prefill-investigate': prefillInvestigate,
                 'prefill-survey': prefillSurvey, 'prefill-salvage': prefillSalvage,
                 'prefill-pirates': prefillPirates, 'prefill-wormhole': prefillWormhole,
-                'prefill-mine': prefillMine, 'open-menu': openMenu };
+                'prefill-mine': prefillMine, 'prefill-launch': prefillLaunch,
+                'open-menu': openMenu };
 
   const _winHandled = new Map();   // window-path request id -> reply (dedup, F40)
   window.addEventListener('message', async (ev) => {
