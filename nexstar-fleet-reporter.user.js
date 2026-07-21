@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         NexStar Fleet Reporter
 // @namespace    https://nexusnavigators.us/
-// @version      1.27.0
+// @version      1.28.0
 // @description  Reports your Nexus Legacy fleet positions to the NexStar map, and answers the map's fuel-estimate and own-planet logistics requests. Your session token never leaves your browser. SECURITY: hosted from a public branch-protected GitHub repo, no silent auto-update; the map can only run self-owned actions (transfers, colony builds) without an in-game confirm.
 // @match        https://s0.nexuslegacy.space/*
 // @match        https://nexstar.nexusnavigators.us/*
@@ -470,6 +470,28 @@
       : (raw <= 0 ? 0 : Math.min(600000, Math.max(1000, Math.floor(raw))));
     return { effect, color, durationMs, css: US_HIGHLIGHT_EFFECTS[effect](selector, color) };
   }
+  // ── Report cadence (pure; v1.28) ────────────────────────────────────────────
+  // Only the LEADER game tab posts a report (multi-tab in ONE browser → a single
+  // poster, so it never trips the ingest 20s throttle). Two reporters that CAN'T
+  // share a leader — separate browsers or devices, since the leader lease lives
+  // in per-browser storage — are de-phased instead: each cycle is the base
+  // interval plus random jitter, so two independent posters drift apart rather
+  // than colliding on the throttle every single cycle. `rand` in [0,1) is passed
+  // in (the block stays side-effect-free). A non-leader re-checks in 5s so it can
+  // take over promptly when the leader tab goes away.
+  function usNextReportDelay(baseMs, isLeader, extraBackoffMs, rand) {
+    const base = Math.max(1000, +baseMs || 0);
+    if (!isLeader) return 5000;
+    const jit = Math.floor((rand || 0) * Math.max(1000, base * 0.5));
+    return base + jit + Math.max(0, +extraBackoffMs || 0);
+  }
+  // One-shot extra backoff applied after a 429: a full base interval plus up to
+  // another, shoving a phase-locked co-poster out of the collision window so the
+  // next cycles stop landing inside each other's throttle gap.
+  function usThrottleBackoff(baseMs, rand) {
+    const base = Math.max(1000, +baseMs || 0);
+    return base + Math.floor((rand || 0) * base);
+  }
   // ==US-ENGINE-END==
 
   // Fetch the published @version. Returns the version string, or null on failure.
@@ -616,6 +638,7 @@
 
   let running = false;
   let runStartedAt = 0;
+  let _reportExtraBackoff = 0;   // one-shot ms added to the next cycle after a 429
   async function report(manual) {
     const key = (GM_getValue('apiKey', '') || '').trim();
     if (!key) { if (manual) alert('No NexStar key set. Use the Tampermonkey menu → "Set NexStar key".'); return; }
@@ -629,6 +652,11 @@
     if (running) return;
     running = true;
     runStartedAt = Date.now();
+    // Claim the report slot for this browser the moment a cycle STARTS (a cycle
+    // takes several seconds of game fetches). A tab promoted to leader mid-cycle
+    // then sees a fresh slot and won't double-post; shared via GM storage, which
+    // is per-browser — exactly the scope the leader lease coordinates.
+    try { GM_setValue('nx_last_report_at', Date.now()); } catch (e) { /* */ }
     try {
       const me = await gget('/api/auth/me');
       const planets = ownedPlanets(me);
@@ -735,7 +763,11 @@
         console.warn('[NexStar] key rejected (401). Re-set it via the Tampermonkey menu.');
         if (manual) alert('NexStar rejected your key. Run /userscript in Discord again and re-paste it.');
       } else if (res.status === 429) {
-        console.log('[NexStar] throttled (429) — will retry next cycle.');
+        // Another reporter on this key beat us inside the throttle window (a
+        // second browser/device — same-browser tabs are already deduped by the
+        // leader gate). Shove our next cycle out of phase so we stop colliding.
+        _reportExtraBackoff = usThrottleBackoff(REPORT_MS(), Math.random());
+        console.log('[NexStar] throttled (429) — de-phasing next cycle by ' + _reportExtraBackoff + 'ms.');
       } else {
         console.warn('[NexStar] report failed:', res.status, res.body);
       }
@@ -746,16 +778,34 @@
     }
   }
 
-  let kickTimer = null;
+  const REPORT_MS = () => Math.max(10, INTERVAL_SEC) * 1000;
   function kick(manual) {
-    clearTimeout(kickTimer);
-    kickTimer = setTimeout(() => report(manual), manual ? 0 : 4000);
+    // A manual "Report fleet now" posts immediately, ungated (the user asked for
+    // it right now); a non-manual kick (key just set) just starts the leader-
+    // gated cadence soon.
+    if (manual) { report(true); return; }
+    scheduleReport(1500);
+  }
+  // Periodic report loop: leader-gated + jittered + on-429 de-phased. amLeader()
+  // and GM leader state are defined lower in this IIFE but only READ here at
+  // fire time (≥ the first delay after load), by when they exist.
+  let _reportTimer = null;
+  function scheduleReport(delay) { clearTimeout(_reportTimer); _reportTimer = setTimeout(reportTick, delay); }
+  async function reportTick() {
+    const base = REPORT_MS();
+    try {
+      if (amLeader()) {
+        const lastAt = +GM_getValue('nx_last_report_at', 0) || 0;
+        if (Date.now() - lastAt >= base * 0.8) await report(false);   // don't double a fresh report from a prior leader
+      }
+    } catch (e) { /* never let a cycle kill the loop */ }
+    const extra = _reportExtraBackoff; _reportExtraBackoff = 0;
+    scheduleReport(usNextReportDelay(base, amLeader(), extra, Math.random()));
   }
 
-  // Initial report shortly after load, then on the interval.
-  kick(false);
-  setInterval(() => report(false), Math.max(10, INTERVAL_SEC) * 1000);
-  console.log('[NexStar] Fleet Reporter active (every ' + Math.max(10, INTERVAL_SEC) + 's). '
+  // Initial cadence starts shortly after load (leader-gated inside reportTick).
+  scheduleReport(4000);
+  console.log('[NexStar] Fleet Reporter active (leader-gated, ~' + Math.max(10, INTERVAL_SEC) + 's + jitter). '
             + 'Set your key via the Tampermonkey menu if you haven\'t.');
 
   // Proactively check once on load; if a newer version is published, surface a
@@ -1391,7 +1441,11 @@
       }
     }
     const notes = [];
-    if (fill.short && fill.short.length) notes.push('short: ' + fill.short.map(s => s.key + ' ' + s.got + '/' + s.want).join(', '));
+    // usPlanFleetFill returns `short` as STRINGS ("cruiser 17/50") — the same
+    // shape the spy-modal flows and the viewer's exploreParseShortfall consume;
+    // join them directly (the old .map(s => s.key…) read fields that never
+    // existed and printed "undefined undefined/undefined").
+    if (fill.short && fill.short.length) notes.push('short: ' + fill.short.join(', '));
     if (fill.missing && fill.missing.length) notes.push('no row: ' + fill.missing.join(', '));
     if (cargoMissing.length) notes.push('no cargo row: ' + cargoMissing.join(', '));
     usApplyHighlight(US_HL_DISPATCH, b.highlight);
