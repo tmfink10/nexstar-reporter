@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         NexStar Fleet Reporter
 // @namespace    https://nexusnavigators.us/
-// @version      1.26.0
+// @version      1.27.0
 // @description  Reports your Nexus Legacy fleet positions to the NexStar map, and answers the map's fuel-estimate and own-planet logistics requests. Your session token never leaves your browser. SECURITY: hosted from a public branch-protected GitHub repo, no silent auto-update; the map can only run self-owned actions (transfers, colony builds) without an in-game confirm.
 // @match        https://s0.nexuslegacy.space/*
 // @match        https://nexstar.nexusnavigators.us/*
@@ -435,6 +435,40 @@
       else plan.push({ index: idx, qty: Math.floor(+qty) });
     }
     return { plan, missing };
+  }
+  // ── Staged-form highlight (v1.27) pure decisions ────────────────────────────
+  // A prefill can MARK the game control the user must press to complete the
+  // staged action ("your next click is THIS one"). The viewer's RPC body may
+  // carry `highlight: { effect?, color?, durationMs? }`; this planner turns it
+  // into CSS. Effects are a TABLE so new looks (colors, outlines, whatever
+  // comes next) are one entry, not a rework. SECURITY: the spec crosses the
+  // relay, so nothing from it is string-injected — effects resolve via this
+  // allowlist (unknown → glow), colors must be a strict hex literal, durations
+  // clamp to sane bounds. Selectors come from the CALLER's own table, never
+  // the wire.
+  const US_HIGHLIGHT_EFFECTS = {
+    glow: (sel, color) =>
+      `${sel}{box-shadow:0 0 0 2px ${color},0 0 12px 2px ${color} !important}`,
+    outline: (sel, color) =>
+      `${sel}{outline:3px solid ${color} !important;outline-offset:2px}`,
+    pulse: (sel, color) =>
+      `@keyframes nsr-hl-pulse{0%,100%{box-shadow:0 0 0 2px ${color},0 0 6px 1px ${color}}` +
+      `50%{box-shadow:0 0 0 3px ${color},0 0 16px 4px ${color}}}` +
+      `${sel}{animation:nsr-hl-pulse 1.2s ease-in-out infinite}`,
+  };
+  function usHighlightPlan(selector, spec) {
+    spec = (spec && typeof spec === 'object') ? spec : {};
+    // OWN properties only — a plain [] lookup would let 'constructor' &co
+    // reach inherited functions instead of the effect table.
+    const effect = Object.prototype.hasOwnProperty.call(US_HIGHLIGHT_EFFECTS, spec.effect)
+      ? String(spec.effect) : 'glow';
+    const color = /^#([0-9a-fA-F]{3,4}|[0-9a-fA-F]{6}|[0-9a-fA-F]{8})$/.test(String(spec.color || ''))
+      ? String(spec.color) : '#f59e0b';
+    // 0 = hold until clicked/unmounted; otherwise clamp to 1s–10min (default 2min).
+    const raw = +spec.durationMs;
+    const durationMs = !isFinite(raw) ? 120000
+      : (raw <= 0 ? 0 : Math.min(600000, Math.max(1000, Math.floor(raw))));
+    return { effect, color, durationMs, css: US_HIGHLIGHT_EFFECTS[effect](selector, color) };
   }
   // ==US-ENGINE-END==
 
@@ -1230,6 +1264,50 @@
     }
     return { placed, missing: fill.missing, short: fill.short };
   }
+  // ── Staged-form highlight applier ──────────────────────────────────────────
+  // Marks the control the user must press to complete a staged action. The
+  // effect is injected as a STYLESHEET rule against the flow's stable class —
+  // never inline node styles: the game is React and re-renders wipe per-node
+  // decoration, while a class-targeted rule survives every rebuild. One
+  // highlight lives at a time; it tears down when the user clicks the control,
+  // when the target unmounts (modal closed / panel left — two consecutive
+  // misses, so a mid-commit React blink can't kill it), on the plan's TTL, or
+  // when the next prefill replaces it. DECORATION ONLY: every path is
+  // try/caught so a highlight problem can never fail the staging itself.
+  const US_HL_MODAL_CONFIRM = '.spy-modal .confirm-investigate-btn, .spy-modal .confirm-spy-btn';
+  const US_HL_SURVEY = '.panel-survey-section button.survey-btn';
+  const US_HL_DISPATCH = '.fleet-page button.dispatch-btn';
+  let _hlTeardown = null;
+  function usApplyHighlight(selector, spec) {
+    try {
+      if (_hlTeardown) _hlTeardown();
+      const plan = usHighlightPlan(selector, spec);
+      const st = document.createElement('style');
+      st.id = 'nsr-staged-highlight';
+      st.textContent = plan.css;
+      document.head.appendChild(st);
+      let iv = 0, to = 0, missing = 0;
+      const teardown = () => {
+        try {
+          _hlTeardown = null;
+          st.remove();
+          document.removeEventListener('click', onClick, true);
+          if (iv) clearInterval(iv);
+          if (to) clearTimeout(to);
+        } catch (e) { /* decoration only */ }
+      };
+      const onClick = (e) => {
+        if (e.target && e.target.closest && e.target.closest(selector)) teardown();
+      };
+      _hlTeardown = teardown;
+      document.addEventListener('click', onClick, true);
+      iv = setInterval(() => {
+        missing = document.querySelector(selector) ? 0 : missing + 1;
+        if (missing >= 2) teardown();
+      }, 1000);
+      if (plan.durationMs > 0) to = setTimeout(teardown, plan.durationMs);
+    } catch (e) { /* decoration only — never fail the staging */ }
+  }
   // Native <select>s need the same native-setter treatment as inputs, but fire
   // 'change' (React listens to change on selects).
   function _pfSetSelect(sel, val) {
@@ -1316,6 +1394,7 @@
     if (fill.short && fill.short.length) notes.push('short: ' + fill.short.map(s => s.key + ' ' + s.got + '/' + s.want).join(', '));
     if (fill.missing && fill.missing.length) notes.push('no row: ' + fill.missing.join(', '));
     if (cargoMissing.length) notes.push('no cargo row: ' + cargoMissing.join(', '));
+    usApplyHighlight(US_HL_DISPATCH, b.highlight);
     return { ok: true, placed, short: notes.length ? notes.join(' · ') : undefined };
   }
   async function prefillInvestigate(req) {
@@ -1331,7 +1410,9 @@
         ' in the game’s survey list — it may have expired or already be en route',
     });
     await _pfSelectSource(modal, fromPlanet);
-    return _pfFillFleet(modal, b.fleet || {}, fromPlanet);
+    const fill = await _pfFillFleet(modal, b.fleet || {}, fromPlanet);
+    usApplyHighlight(US_HL_MODAL_CONFIRM, b.highlight);
+    return fill;
   }
   // ── Dispatch_2: prefill the debris-salvage form (v1.21) ─────────────────────
   // Fleet → Debris tab → the system's debris card → "collect" modal (same
@@ -1353,7 +1434,9 @@
         ' in the game’s debris list — it may have expired or been collected',
     });
     await _pfSelectSource(modal, fromPlanet);
-    return _pfFillFleet(modal, b.fleet || {}, fromPlanet);
+    const fill = await _pfFillFleet(modal, b.fleet || {}, fromPlanet);
+    usApplyHighlight(US_HL_MODAL_CONFIRM, b.highlight);
+    return fill;
   }
 
   // ── Dispatch_2: stage a SURVEY in the game UI (v1.20) ───────────────────────
@@ -1418,6 +1501,9 @@
     await _pfOpenSystemPanel(systemName);
     // STOP. Report readiness; the user clicks "Survey System" themselves.
     const ind = document.querySelector('.survey-status-indicator');
+    // Mark the launch button only when the system is actually surveyable —
+    // highlighting it under a cooldown indicator would point at a dead end.
+    if (!ind) usApplyHighlight(US_HL_SURVEY, b.highlight);
     return { ready: !ind, status: ind ? ind.textContent.trim() : null };
   }
   // ── Dispatch_2: prefill pirate-camp attack / wormhole run / field mine (v1.22) ──
@@ -1439,7 +1525,9 @@
         ' in the game’s list — it may have been cleared',
     });
     await _pfSelectSource(modal, fromPlanet);
-    return _pfFillFleet(modal, b.fleet || {}, fromPlanet);
+    const fill = await _pfFillFleet(modal, b.fleet || {}, fromPlanet);
+    usApplyHighlight(US_HL_MODAL_CONFIRM, b.highlight);
+    return fill;
   }
   async function prefillWormhole(req) {
     const b = req || {};
@@ -1470,7 +1558,9 @@
     cards[wi].querySelector('.wormhole-btn.dispatch').click();
     const modal = await _pfWait(() => document.querySelector('.spy-modal'), 6000, 'wormhole modal');
     await _pfSelectSource(modal, fromPlanet);
-    return _pfFillFleet(modal, b.fleet || {}, fromPlanet);
+    const fill = await _pfFillFleet(modal, b.fleet || {}, fromPlanet);
+    usApplyHighlight(US_HL_MODAL_CONFIRM, b.highlight);
+    return fill;
   }
   async function prefillMine(req) {
     const b = req || {};
@@ -1508,7 +1598,9 @@
     mineBtn.click();
     const modal = await _pfWait(() => document.querySelector('.spy-modal'), 6000, 'mining modal');
     await _pfSelectSource(modal, fromPlanet);
-    return _pfFillFleet(modal, b.fleet || {}, fromPlanet);
+    const fill = await _pfFillFleet(modal, b.fleet || {}, fromPlanet);
+    usApplyHighlight(US_HL_MODAL_CONFIRM, b.highlight);
+    return fill;
   }
 
   // ── open-menu (v1.23): focus a colony and open one of its game menus ───────
