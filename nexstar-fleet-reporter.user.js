@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         NexStar Fleet Reporter
 // @namespace    https://nexusnavigators.us/
-// @version      1.28.0
+// @version      1.29.0
 // @description  Reports your Nexus Legacy fleet positions to the NexStar map, and answers the map's fuel-estimate and own-planet logistics requests. Your session token never leaves your browser. SECURITY: hosted from a public branch-protected GitHub repo, no silent auto-update; the map can only run self-owned actions (transfers, colony builds) without an in-game confirm.
 // @match        https://s0.nexuslegacy.space/*
 // @match        https://nexstar.nexusnavigators.us/*
@@ -241,7 +241,11 @@
   const EXPLORE_DISPATCH_OK = [
     /^\/api\/fleet\/survey$/, /^\/api\/fleet\/collect-debris$/, /^\/api\/fleet\/attack-pirates$/,
     /^\/api\/fleet\/wormhole-run$/, /^\/api\/fleet\/investigate$/, /^\/api\/fleet\/mine$/,
-    /^\/api\/planets\/\d+\/shipyard\/repair$/,
+    // Repair fans out per damaged stack over BOTH of the game's repair routes:
+    // combat ships queue at the shipyard, miners/ice drills take the instant
+    // alloy "maintenance" route (see US_MAINTENANCE_SHIPS above). Both are
+    // self-owned, planet-local, non-destructive.
+    /^\/api\/planets\/\d+\/shipyard\/repair$/, /^\/api\/planets\/\d+\/maintenance-repair$/,
   ];
   // → error string (veto) or null (all calls allowed).
   function exploreCallsAllowed(calls) {
@@ -435,6 +439,39 @@
       else plan.push({ index: idx, qty: Math.floor(+qty) });
     }
     return { plan, missing };
+  }
+  // ── prefill-repair (v1.29) pure decisions ──────────────────────────────────
+  // The shipyard page offers TWO different repairs per damaged stack, and which
+  // one it renders is decided by the game's own MAINTENANCE_COST table
+  // (extracted from the live bundle chunk mining-*.js, 2026-07-26):
+  //   MAINTENANCE_COST = { miner: 15, ice_drill: 25 }
+  // In ShipyardPage the row's buttons are gated on exactly that:
+  //   Maintain  ⇔ damagedQuantity > 0 && MAINTENANCE_COST[key] != null
+  //   Repair    ⇔ damagedQuantity > 0 && MAINTENANCE_COST[key] == null
+  // So a miner/ice_drill can ONLY be maintained (flat alloys, instant, its own
+  // /maintenance-repair route) and never has a shipyard Repair button at all —
+  // which is why Ops' one-size POST to /shipyard/repair never fixed a miner.
+  // Mirror the table (not the ship class): the game keys off the ship KEY.
+  const US_MAINTENANCE_SHIPS = { miner: 15, ice_drill: 25 };
+  function usIsMaintenanceShip(shipKey) {
+    return Object.prototype.hasOwnProperty.call(US_MAINTENANCE_SHIPS, String(shipKey || ''));
+  }
+  // → index of the shipyard fleet row for this ship, or -1. Rows are described
+  // as [{ icon, damaged, hasAction }]; icons are locale-proof
+  // (/api/images/ships/terran/<shipKey>.webp?v=…, same technique as the modal
+  // ship rows). Rows with nothing damaged — or with no repair/maintain button
+  // rendered — never match: staging them would point the user at nothing.
+  function usPickShipyardRow(rows, shipKey) {
+    const want = String(shipKey || '').trim().toLowerCase();
+    const iconKey = s => String(s || '').split('/').pop().split('?')[0].replace(/\.\w+$/, '').toLowerCase();
+    return (rows || []).findIndex(r => r && r.damaged > 0 && r.hasAction
+      && iconKey(r.icon) === want);
+  }
+  // → the FIRST damaged row with an action, or -1. Fallback when the requested
+  // stack isn't on the page (the report can lag a repair done in the game):
+  // something else is repairable here, so stage that instead of erroring out.
+  function usPickAnyShipyardRow(rows) {
+    return (rows || []).findIndex(r => r && r.damaged > 0 && r.hasAction);
   }
   // ── Staged-form highlight (v1.27) pure decisions ────────────────────────────
   // A prefill can MARK the game control the user must press to complete the
@@ -1327,6 +1364,10 @@
   const US_HL_MODAL_CONFIRM = '.spy-modal .confirm-investigate-btn, .spy-modal .confirm-spy-btn';
   const US_HL_SURVEY = '.panel-survey-section button.survey-btn';
   const US_HL_DISPATCH = '.fleet-page button.dispatch-btn';
+  // Shipyard repair: mark every Maintain/Repair button on the damaged rows.
+  // Scoped to `-actions-left` — the DISMANTLE button is the `-right` group, and
+  // it shares the `.repair-btn` class. Never invite a click on that one.
+  const US_HL_SHIPYARD_REPAIR = '.sy-fleet-row .sy-fleet-row-actions-left .repair-btn:not(.scrap-btn)';
   let _hlTeardown = null;
   function usApplyHighlight(selector, spec) {
     try {
@@ -1657,6 +1698,72 @@
     return fill;
   }
 
+  // ── Dispatch_2: stage a REPAIR on the shipyard page (v1.29) ────────────────
+  // Repair is the one Ops job with no fleet and no travel, so it has no modal:
+  // the shipyard page's own fleet list carries a per-stack Maintain/Repair
+  // button. Staging = focus the planet, open /shipyard, scroll the damaged
+  // stack into view, and MARK its button. The buttons are never clicked — both
+  // of them open a further game confirm/dialog anyway, and "Maintain" spends
+  // alloys the moment it is confirmed. The DISMANTLE button in the same row is
+  // deliberately excluded from the highlight (see US_HL_SHIPYARD_REPAIR).
+  // DOM contract (ShipyardPage-*.js, read 2026-07-26): `.sy-fleet-summary` >
+  // `.sy-fleet-cat-section` > `.sy-fleet-rows` > `.sy-fleet-row`, each with a
+  // `.sy-fleet-damaged` chip when damagedQuantity > 0, an EntityIcon <img>
+  // (/api/images/ships/terran/<shipKey>.webp?v=…) and, in
+  // `.sy-fleet-row-actions-left`, `button.repair-btn.maintenance-btn`
+  // (maintenance ships) or `button.repair-btn` (everything else).
+  function _pfShipyardRows() {
+    return [...document.querySelectorAll('.sy-fleet-summary .sy-fleet-row')].map(el => {
+      const img = el.querySelector('img');
+      const dmg = el.querySelector('.sy-fleet-damaged');
+      const btn = el.querySelector('.sy-fleet-row-actions-left .repair-btn:not(.scrap-btn)');
+      return {
+        el, btn,
+        icon: (img && img.getAttribute('src')) || '',
+        // "🛠 3 damaged" — the word is localized, the digits are not.
+        damaged: dmg ? (parseInt(String(dmg.textContent || '').replace(/[^0-9]/g, ''), 10) || 0) : 0,
+        hasAction: !!btn,
+        maintenance: !!(btn && btn.classList.contains('maintenance-btn')),
+      };
+    });
+  }
+  async function prefillRepair(req) {
+    const b = req || {};
+    const fromPlanet = String(b.fromPlanet || '').trim();
+    const shipKey = String(b.shipKey || '').trim();
+    if (!fromPlanet) throw new Error('bad prefill-repair request');
+    // The shipyard page operates on the ACTIVE planet — focus it first, exactly
+    // like survey/mine/open-menu do.
+    await _pfSetActivePlanet(fromPlanet, String(b.fromSystem || '').trim());
+    const nav = document.querySelector('a.sidebar-link[href="/shipyard"]');
+    if (!nav) throw new Error('game sidebar not found — is the game tab fully loaded?');
+    nav.click();
+    // The fleet list arrives from its own fetch after the page mounts, so wait
+    // for a row with something to repair rather than for the container.
+    const rows = await _pfWait(() => {
+      const r = _pfShipyardRows();
+      return r.some(x => x.damaged > 0 && x.hasAction) ? r : null;
+    }, 12000, 'a repairable stack on the shipyard page').catch(() => _pfShipyardRows());
+    let i = usPickShipyardRow(rows, shipKey);
+    const exact = i >= 0;
+    if (i < 0) i = usPickAnyShipyardRow(rows);
+    if (i < 0) throw new Error('nothing repairable at ' + fromPlanet +
+      ' on the game’s shipyard page — the damage report may be stale, or the ' +
+      'ships already repaired');
+    const row = rows[i];
+    try { row.el.scrollIntoView({ block: 'center' }); } catch (e) { /* cosmetic */ }
+    usApplyHighlight(US_HL_SHIPYARD_REPAIR, b.highlight);
+    // A disabled button carries its reason as the label (not enough alloys,
+    // shipyard busy) — surface it instead of claiming the form is ready.
+    const blocked = row.btn && row.btn.disabled
+      ? (row.btn.getAttribute('title') || row.btn.textContent || '').trim() : null;
+    return {
+      ok: true, exact, damaged: row.damaged, blocked,
+      kind: row.maintenance ? 'maintain' : 'repair',
+      stacks: rows.filter(r => r.damaged > 0 && r.hasAction).length,
+    };
+  }
+
   // ── open-menu (v1.23): focus a colony and open one of its game menus ───────
   // The read-only Empire Console's click-through: instead of building/queuing
   // inside the console, clicking a colony's construction/shipyard/research
@@ -1702,7 +1809,7 @@
                 'prefill-survey': prefillSurvey, 'prefill-salvage': prefillSalvage,
                 'prefill-pirates': prefillPirates, 'prefill-wormhole': prefillWormhole,
                 'prefill-mine': prefillMine, 'prefill-launch': prefillLaunch,
-                'open-menu': openMenu };
+                'prefill-repair': prefillRepair, 'open-menu': openMenu };
 
   const _winHandled = new Map();   // window-path request id -> reply (dedup, F40)
   window.addEventListener('message', async (ev) => {
